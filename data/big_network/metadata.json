@@ -1,0 +1,25 @@
+{
+  "name": "pedestrian_network",
+  "source": "OSMnx graph",
+  "simplified": false,
+  "remove_isolates": true,
+  "bbox_rd": [
+    91229,
+    432752,
+    92777,
+    434641
+  ],
+  "bbox_wgs84": [
+    51.87964934715427,
+    4.461038681218709,
+    51.89680159732032,
+    4.483176880572892
+  ],
+  "temperature_raster": "src/scripts/merged_files/UTCI.zarr",
+  "temperature_attribute_prefix": "temp_mean",
+  "crs": "epsg:4326",
+  "graph_attrs": {
+    "created_date": "2026-04-28 10:06:08",
+    "created_with": "OSMnx 2.0.7"
+  }
+}
