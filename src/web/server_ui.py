@@ -11,7 +11,7 @@ from maplibre.basemaps import Carto
 from maplibre.controls import NavigationControl, ScaleControl
 from maplibre.sources import GeoJSONSource
 
-from api_client import fetch_network, fetch_route
+from src.web.api_client import fetch_network, fetch_route
 
 
 HOURS = list(range(24))

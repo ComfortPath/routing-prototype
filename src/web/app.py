@@ -1,6 +1,6 @@
 from shiny import App
 
-from server_ui import server
+from src.web.server_ui import server
 from shiny import ui
 from maplibre import output_maplibregl
 
