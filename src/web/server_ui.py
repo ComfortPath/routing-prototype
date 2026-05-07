@@ -1,8 +1,11 @@
+"""Server-side logic for the Shiny UTCI network and route planner."""
+
 from __future__ import annotations
 
 from copy import deepcopy
 import math
 import statistics
+from typing import Any
 
 from shiny import reactive, render, ui
 from maplibre import Layer, LayerType, Map, MapContext, MapOptions
@@ -14,7 +17,12 @@ from maplibre.sources import GeoJSONSource
 from src.web.api_client import fetch_network, fetch_route
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 HOURS = list(range(24))
+UTCI_CATEGORY_VARIABLE = "utci_category"
 NETWORK_LAYER_ID = "network-edges"
 ROUTE_LAYER_ID = "route-path"
 MARKER_LAYER_ID = "route-markers"
@@ -22,44 +30,58 @@ FALLBACK_CENTER = (4.48, 51.92)  # Rotterdam-ish default
 EMPTY_GEOJSON: dict = {"type": "FeatureCollection", "features": []}
 
 
-# ── Temperature helpers ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Hourly array-value helpers
+# ---------------------------------------------------------------------------
 
-def _clean_temp(value) -> float | None:
-    """Return a usable float temperature or None."""
+def _clean_float(value: Any) -> float | None:
+    """Return a finite float or None."""
     try:
         value = float(value)
     except (TypeError, ValueError):
         return None
 
-    if math.isnan(value) or math.isclose(value, 0.0, abs_tol=0.01):
+    if math.isnan(value) or math.isinf(value):
         return None
 
     return value
 
 
-def _hour_values(network_data: dict, hour: int) -> list[float]:
-    """Collect valid temperature values for one hour from API geojson."""
-    attr = f"temp_mean_{hour}"
+def _hourly_value(props: dict, variable: str, hour: int) -> float | None:
+    """
+    Return props[variable][hour] as a float.
+
+    The expected API property shape is:
+
+        {"utci_category": [value_00, value_01, ..., value_23]}
+    """
+    values = props.get(variable)
+
+    if not isinstance(values, list) or hour >= len(values):
+        return None
+
+    return _clean_float(values[hour])
+
+
+def _hour_values(network_data: dict, hour: int, variable: str) -> list[float]:
+    """Collect valid selected-hour values from all network edge features."""
     values: list[float] = []
 
     for feature in network_data.get("geojson", {}).get("features", []):
         props = feature.get("properties", {})
-        temp = _clean_temp(props.get(attr))
-        if temp is not None:
-            values.append(temp)
+        value = _hourly_value(props, variable, hour)
+        if value is not None:
+            values.append(value)
 
     return values
 
 
-def build_hour_stats(network_data: dict) -> dict[int, dict[str, float]]:
-    """
-    Build per-hour stats if temp_mean_* properties are present in the API payload.
-    Returns an empty dict when the API only provides plain network geometry.
-    """
+def build_hour_stats(network_data: dict, variable: str) -> dict[int, dict[str, float]]:
+    """Build min/median/max statistics for each hour of an array-valued variable."""
     stats: dict[int, dict[str, float]] = {}
 
     for hour in HOURS:
-        values = _hour_values(network_data, hour)
+        values = _hour_values(network_data, hour, variable)
         if not values:
             continue
 
@@ -89,7 +111,7 @@ def scale_bounds(
     norm_mode: str,
     hour_stats: dict[int, dict[str, float]],
 ) -> tuple[float, float, float] | None:
-    """Return colour scale bounds for the current hour/mode."""
+    """Return colour scale bounds for the current hour and normalisation mode."""
     if not hour_stats or hour not in hour_stats:
         return None
 
@@ -106,23 +128,28 @@ def scale_bounds(
     return lo, mid, hi
 
 
-def geojson_for_hour(network_data: dict, hour: int) -> dict:
+def geojson_for_hour(network_data: dict, hour: int, variable: str) -> dict:
     """
-    Copy API geojson and map temp_mean_<hour> -> temp so the existing
-    MapLibre colour expression can use a single 'temp' property.
+    Copy API GeoJSON and map props[variable][hour] to a single 'temp' property.
+
+    MapLibre can then colour edges using one stable property name regardless of
+    which hour is selected.
     """
     geojson = deepcopy(network_data.get("geojson", EMPTY_GEOJSON))
-    attr = f"temp_mean_{hour}"
 
     for feature in geojson.get("features", []):
         props = feature.setdefault("properties", {})
-        props["temp"] = _clean_temp(props.get(attr))
+        props["temp"] = _hourly_value(props, variable, hour)
 
     return geojson
 
 
+# ---------------------------------------------------------------------------
+# Map helpers
+# ---------------------------------------------------------------------------
+
 def color_expression(t_min: float, t_mid: float, t_max: float) -> list:
-    """Blue -> white -> red temperature colour scale."""
+    """Return a blue-white-red MapLibre expression for the selected-hour value."""
     return [
         "case",
         ["==", ["get", "temp"], None],
@@ -142,12 +169,11 @@ def color_expression(t_min: float, t_mid: float, t_max: float) -> list:
 
 
 def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
-    """Create the base MapLibre map with network + empty route/marker layers."""
+    """Create the base MapLibre map with network, route, and marker layers."""
     m = Map(MapOptions(center=center, zoom=13, style=Carto.DARK_MATTER))
     m.add_control(NavigationControl(), position="bottom-right")
     m.add_control(ScaleControl(), position="bottom-left")
 
-    # Network layer
     m.add_layer(
         Layer(
             id=NETWORK_LAYER_ID,
@@ -161,7 +187,6 @@ def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
         )
     )
 
-    # Route overlay layer (starts empty)
     m.add_layer(
         Layer(
             id=ROUTE_LAYER_ID,
@@ -175,7 +200,6 @@ def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
         )
     )
 
-    # Marker layer for origin / destination points
     m.add_layer(
         Layer(
             id=MARKER_LAYER_ID,
@@ -203,38 +227,49 @@ def _marker_geojson(
     origin: tuple[float, float] | None,
     destination: tuple[float, float] | None,
 ) -> dict:
-    """Build a FeatureCollection for the two click markers."""
+    """Build a FeatureCollection for the selected origin/destination markers."""
     features = []
+
     if origin:
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": list(origin)},
             "properties": {"marker": "origin"},
         })
+
     if destination:
         features.append({
             "type": "Feature",
             "geometry": {"type": "Point", "coordinates": list(destination)},
             "properties": {"marker": "destination"},
         })
+
     return {"type": "FeatureCollection", "features": features}
 
 
-# ── Server ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Shiny server
+# ---------------------------------------------------------------------------
 
 def server(input, output, session):
+    """Register Shiny reactives, map rendering, and API route requests."""
     network_data = reactive.value(None)
-    hour_stats_data = reactive.value({})
     load_error = reactive.value(None)
 
-    # Route planner state
-    # Each is (lon, lat) or None
     route_origin: reactive.value[tuple[float, float] | None] = reactive.value(None)
     route_destination: reactive.value[tuple[float, float] | None] = reactive.value(None)
     route_result_data: reactive.value[dict | None] = reactive.value(None)
     route_error: reactive.value[str | None] = reactive.value(None)
     route_loading: reactive.value[bool] = reactive.value(False)
     route_request_time: reactive.value[int | None] = reactive.value(None)
+
+    @reactive.Calc
+    def hour_stats_data() -> dict[int, dict[str, float]]:
+        """Compute hourly stats for the fixed UTCI category variable."""
+        data = network_data()
+        if data is None:
+            return {}
+        return build_hour_stats(data, UTCI_CATEGORY_VARIABLE)
 
     # ── Load network ──────────────────────────────────────────────────────────
 
@@ -250,7 +285,6 @@ def server(input, output, session):
             return
 
         network_data.set(data)
-        hour_stats_data.set(build_hour_stats(data))
 
     # ── Initial map render ────────────────────────────────────────────────────
 
@@ -268,14 +302,14 @@ def server(input, output, session):
 
             if stats:
                 bounds = scale_bounds(0, "per_hour", stats)
-                geojson = geojson_for_hour(data, 0)
+                geojson = geojson_for_hour(data, 0, UTCI_CATEGORY_VARIABLE)
                 line_color = color_expression(*bounds) if bounds else "#4da3ff"
             else:
                 geojson = data.get("geojson", EMPTY_GEOJSON)
 
         return build_map(center, geojson, line_color)
 
-    # ── Temperature network updates ───────────────────────────────────────────
+    # ── UTCI network updates ───────────────────────────────────────────
 
     @reactive.Effect
     async def _update_map():
@@ -286,7 +320,7 @@ def server(input, output, session):
         stats = hour_stats_data()
 
         if stats:
-            geojson = geojson_for_hour(data, input.hour())
+            geojson = geojson_for_hour(data, input.hour(), UTCI_CATEGORY_VARIABLE)
             bounds = scale_bounds(input.hour(), input.norm_mode(), stats)
             line_color = color_expression(*bounds) if bounds else "#4da3ff"
         else:
@@ -297,7 +331,7 @@ def server(input, output, session):
             m.set_data(NETWORK_LAYER_ID, geojson)
             m.set_paint_property(NETWORK_LAYER_ID, "line-color", line_color)
 
-    # ── Map click handler — collect route points ──────────────────────────────
+    # ── Map click handler ─────────────────────────────────────────────────────
 
     @reactive.Effect
     @reactive.event(input.map_clicked)
@@ -326,10 +360,7 @@ def server(input, output, session):
             return
 
         async with MapContext("map") as m:
-            m.set_data(
-                MARKER_LAYER_ID,
-                _marker_geojson(route_origin(), route_destination()),
-            )
+            m.set_data(MARKER_LAYER_ID, _marker_geojson(route_origin(), route_destination()))
 
     # ── Clear points button ───────────────────────────────────────────────────
 
@@ -347,6 +378,7 @@ def server(input, output, session):
             m.set_data(ROUTE_LAYER_ID, EMPTY_GEOJSON)
 
     # ── Find route button ─────────────────────────────────────────────────────
+
     @reactive.Effect
     @reactive.event(input.find_route)
     async def _find_route():
@@ -359,18 +391,20 @@ def server(input, output, session):
 
         selected_hour = int(input.time())
         route_request_time.set(selected_hour)
-
         route_error.set(None)
         route_loading.set(True)
 
         try:
-            result = await fetch_route(origin, dest, selected_hour)
+            result = await fetch_route(
+                origin,
+                dest,
+                selected_hour,
+            )
             result["requested_hour"] = selected_hour
             route_result_data.set(result)
 
-            route_geojson = result.get("geojson", EMPTY_GEOJSON)
             async with MapContext("map") as m:
-                m.set_data(ROUTE_LAYER_ID, route_geojson)
+                m.set_data(ROUTE_LAYER_ID, result.get("geojson", EMPTY_GEOJSON))
 
         except Exception as exc:
             route_error.set(str(exc))
@@ -378,11 +412,15 @@ def server(input, output, session):
         finally:
             route_loading.set(False)
 
-    # ── Sidebar outputs ───────────────────────────────────────────────────────
+    # ── Network/sidebar outputs ───────────────────────────────────────────────
 
     @render.text
     def hour_label():
         return f"{input.hour():02d}:00"
+
+    @render.text
+    def time_label():
+        return f"{input.time():02d}:00"
 
     @render.ui
     def network_stats():
@@ -401,59 +439,59 @@ def server(input, output, session):
 
     @render.ui
     def temp_stats():
-        stats = hour_stats_data()
-
         if load_error() is not None:
-            return ui.p("Temperature data unavailable because the network failed to load.")
+            return ui.p("Hourly values unavailable because the network failed to load.")
 
-        if not stats or input.hour() not in stats:
-            return ui.p("No temperature fields exposed by the API.")
+        stats = hour_stats_data()
+        hour = input.hour()
+        variable = UTCI_CATEGORY_VARIABLE
 
-        s = stats[input.hour()]
+        if not stats or hour not in stats:
+            return ui.p(f"No hourly UTCI category property named {variable!r} is exposed by the API.")
+
+        s = stats[hour]
         return ui.layout_columns(
-            ui.value_box("Min", f"{s['min']:.1f} C"),
-            ui.value_box("Median", f"{s['median']:.1f} C"),
-            ui.value_box("Max", f"{s['max']:.1f} C"),
+            ui.value_box("Min", f"{s['min']:.1f}"),
+            ui.value_box("Median", f"{s['median']:.1f}"),
+            ui.value_box("Max", f"{s['max']:.1f}"),
             col_widths=[4, 4, 4],
         )
 
     @render.ui
     def scale_range():
-        stats = hour_stats_data()
-
         if load_error() is not None:
             return ui.p("Unavailable.")
 
-        bounds = scale_bounds(input.hour(), input.norm_mode(), stats)
+        bounds = scale_bounds(input.hour(), input.norm_mode(), hour_stats_data())
         if bounds is None:
-            return ui.p("Temperature data unavailable from API.")
+            return ui.p("Hourly UTCI category data unavailable from API.")
 
         lo, _, hi = bounds
-        return ui.p(f"{lo:.1f} C (blue)  ->  {hi:.1f} C (red)")
+        return ui.p(f"{lo:.1f} (blue)  ->  {hi:.1f} (red)")
 
     # ── Route planner sidebar outputs ─────────────────────────────────────────
 
     @render.ui
     def origin_display():
-        o = route_origin()
-        if o is None:
+        origin = route_origin()
+        if origin is None:
             return ui.p(ui.em("Click the map to set origin"), style="color: #888;")
         return ui.p(
             ui.span("●", style="color: #44dd88; margin-right: 6px;"),
-            f"{o[1]:.5f} N,  {o[0]:.5f} E",
+            f"{origin[1]:.5f} N,  {origin[0]:.5f} E",
         )
 
     @render.ui
     def destination_display():
-        o = route_origin()
-        d = route_destination()
-        if o is None:
+        origin = route_origin()
+        destination = route_destination()
+        if origin is None:
             return ui.p(ui.em("Set origin first"), style="color: #888;")
-        if d is None:
+        if destination is None:
             return ui.p(ui.em("Click the map to set destination"), style="color: #888;")
         return ui.p(
             ui.span("●", style="color: #ff5555; margin-right: 6px;"),
-            f"{d[1]:.5f} N,  {d[0]:.5f} E",
+            f"{destination[1]:.5f} N,  {destination[0]:.5f} E",
         )
 
     @render.ui
@@ -463,9 +501,7 @@ def server(input, output, session):
 
         err = route_error()
         if err:
-            return ui.div(
-                ui.p(err, style="color: #ff6666;"),
-            )
+            return ui.div(ui.p(err, style="color: #ff6666;"))
 
         result = route_result_data()
         if result is None:
@@ -473,17 +509,30 @@ def server(input, output, session):
 
         distance_m = result.get("distance_m")
         duration_s = result.get("duration_s")
+        cost = result.get("cost")
+        variable = result.get("weight_variable", UTCI_CATEGORY_VARIABLE)
+        hour = result.get("weight_hour")
 
         parts = []
         if distance_m is not None:
-            km = distance_m / 1000
-            parts.append(ui.value_box("Distance", f"{km:.2f} km"))
+            parts.append(ui.value_box("Distance", f"{distance_m / 1000:.2f} km"))
+        if cost is not None:
+            parts.append(ui.value_box("Route cost", f"{cost:.2f}"))
+
+        detail = ui.p(
+            f"UTCI routing: {variable}[{hour}]" if hour is not None else f"UTCI routing: {variable}",
+            style="font-size: 0.9em; color: #aaa; margin-top: 0.5rem;",
+        )
+
         if duration_s is not None:
             mins = int(duration_s // 60)
             secs = int(duration_s % 60)
             parts.append(ui.value_box("Duration", f"{mins}m {secs:02d}s"))
 
         if not parts:
-            return ui.p("Route received — no distance/duration in response.")
+            return ui.div(ui.p("Route received — no distance/cost in response."), detail)
 
-        return ui.layout_columns(*parts, col_widths=[6, 6] if len(parts) == 2 else [12])
+        return ui.div(
+            ui.layout_columns(*parts, col_widths=[6] * min(len(parts), 2)),
+            detail,
+        )

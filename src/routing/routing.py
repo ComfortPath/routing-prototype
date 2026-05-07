@@ -1,329 +1,192 @@
 from __future__ import annotations
 
 import heapq
-import logging
-import math
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import geopandas as gpd
 
-import networkx as nx
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Type alias
-# ---------------------------------------------------------------------------
-
-WeightHook = Callable[[str, str, dict[str, Any], float], float]
+from ..schema import NetworkSchema
 
 
-# ---------------------------------------------------------------------------
-# Edge selection
-# ---------------------------------------------------------------------------
-
-def _canonical_edge(edges: dict[int, dict[str, Any]]) -> dict[str, Any]:
+class NumpyRoutingNetwork:
     """
-    Return the attributes of the canonical (forward) edge.
+    Routing representation based on NumPy arrays and an adjacency list.
+
+    Uses the NetworkSchema defined in the parent folder and converts the geoparquet files (which were built according to this schema),
+    to a network representation that is suitable for routing.
+
     """
-    return edges.get(0) or next(iter(edges.values()))
 
+    def __init__(
+        self,
+        schema: NetworkSchema,
+        directed: bool = False,
+    ) -> None:
+        # save original information so the actual route can be retrieved when it's calculated on the NumpyRoutingNetwork
+        self.metadata = dict(schema.metadata)
+        self.edges = schema.edges.reset_index(drop=True)
+        self.directed = directed
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
-def _safe_float(value: Any, default: float | None = None) -> float | None:
-    try:
-        x = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(x):
-        return default
-    return x
-
-
-def _minmax_norm(x: float, xmin: float, xmax: float) -> float:
-    if xmax <= xmin:
-        return 0.0
-    return min(max((x - xmin) / (xmax - xmin), 0.0), 1.0)
-
-
-def _compute_temp_normalization_stats(
-    graph: nx.MultiDiGraph,
-    *,
-    length_attr: str,
-    temp_attr: str,
-) -> dict[str, float]:
-    """
-    Scan canonical edges once and collect min/max values for normalization.
-    """
-    lengths: list[float] = []
-    temps: list[float] = []
-
-    for u, v, key, attrs in graph.edges(keys=True, data=True):
-        if key != 0:
-            continue
-
-        length = _safe_float(attrs.get(length_attr))
-        if length is not None and length > 0:
-            lengths.append(length)
-
-        temp = _safe_float(attrs.get(temp_attr))
-        if temp is not None:
-            temps.append(temp)
-
-    if not lengths:
-        raise ValueError(
-            f"No valid positive values found for length attribute {length_attr!r}."
+        # keep originals OSM ids
+        self.node_ids = (
+            schema.nodes["node_id"].to_numpy()
+            if "node_id" in schema.nodes.columns
+            else schema.nodes.index.to_numpy()
         )
 
-    if not temps:
-        raise ValueError(
-            f"No valid values found for temperature attribute {temp_attr!r}."
+        # save internal idx suitable to use as an numpy index and create lookup table that maps the new idx to the osm_id
+        # idx are dense: 0 .. node.size, while previous osm ids are 1827394029 or 187283749, which would require A LOT of empty rows
+        self.node_to_idx = {
+            node_id: idx
+            for idx, node_id in enumerate(self.node_ids)
+        }
+
+        # adjust original edge_ids to correspond to the internal ix
+        self.edge_u = np.array(
+            [self.node_to_idx[u] for u in self.edges["u"]],
+            dtype=np.int64,
+        )
+        self.edge_v = np.array(
+            [self.node_to_idx[v] for v in self.edges["v"]],
+            dtype=np.int64,
         )
 
-    stats = {
-        "length_min": min(lengths),
-        "length_max": max(lengths),
-        "temp_min": min(temps),
-        "temp_max": max(temps),
-    }
+        # update edge cost to the length of the edge
+        self.edge_cost = self.edges["length"].to_numpy(dtype=float)
 
-    log.info(
-        "Normalization stats | %s in [%.3f, %.3f] | %s in [%.3f, %.3f]",
-        length_attr,
-        stats["length_min"],
-        stats["length_max"],
-        temp_attr,
-        stats["temp_min"],
-        stats["temp_max"],
-    )
+        # get size of arrays
+        self.n_nodes = len(self.node_ids)
+        self.n_edges = len(self.edges)
 
-    return stats
+        # create empty adjacency list
+        self.adjacency: list[list[tuple[int, int]]] = [
+            [] for _ in range(self.n_nodes)
+        ]
 
+        # fill adjacency list with all the connected nodes
+        for edge_idx, (u, v) in enumerate(zip(self.edge_u, self.edge_v)):
+            self.adjacency[u].append((v, edge_idx))
 
-# ---------------------------------------------------------------------------
-# Weight computation
-# ---------------------------------------------------------------------------
+            # if input graph is undirected add both directions as possibilities for routing
+            # u -> v and v -> u
+            if not directed:
+                self.adjacency[v].append((u, edge_idx))
 
-def _edge_weight(
-    u: str,
-    v: str,
-    edges: dict[int, dict[str, Any]],
-    weight_attr: str,
-    weight_hooks: list[WeightHook],
-) -> float:
-    """
-    Return the effective routing weight for the edge u->v.
-    """
-    attrs = _canonical_edge(edges)
+    def add_weights(self, columns: list[str], length: np.ndarray, hour: int) -> np.ndarray:
+        """
+        Update the edge weight to also include the environmental information
 
-    raw = attrs.get(weight_attr)
-    try:
-        weight = float(raw) if raw is not None else 1.0
-    except (TypeError, ValueError):
-        weight = 1.0
+        with C_e = L_e * (1 + P_e). The cost of an edge is dependent on the lenght plus the environemental penalty.
 
-    if not math.isfinite(weight) or weight <= 0:
-        weight = 1.0
+        Penalty is decided by P_e = sum_(i=1)^n w_i * gamma_i (s) * p_i
+        with:
+        $w$: being the user defined importance of a variable 
+        $gamma$: being the dynamic sensitivity function that depends on route-state $s$.
+        $p$: the normalized envioronmental penalty on edge $e$
+        """
+        thermal_multiplier = {
+            5: 0.0,  # no thermal stress
+            6: 0.10,  # moderate heat
+            7: 0.35,  # strong heat
+            8: 1.00,  # very strong heat
+            9: 3.00,  # extreme heat / near-avoid
+        }
+        total_penalty = np.zeros_like(length, dtype=float)
 
-    log.info(
-        "Edge %s -> %s | base %r=%r | parsed_weight=%.3f",
-        u, v, weight_attr, raw, weight
-    )
+        for attribute in columns:
+            penalty = self.edges[attribute].to_numpy()
+            mapped_penalty = np.array([
+                thermal_multiplier[int(p[hour])] for p in penalty
+            ])
 
-    for hook in weight_hooks:
-        before = weight
-        weight = hook(u, v, attrs, weight)
+            total_penalty += mapped_penalty
 
-        if not math.isfinite(weight) or weight < 0:
-            raise ValueError(
-                f"Hook {hook.__name__!r} returned an invalid weight "
-                f"({weight}) for edge ({u} -> {v})."
-            )
-
-        log.info(
-            "Edge %s -> %s | hook=%s | before=%.3f | after=%.3f",
-            u, v, getattr(hook, "__name__", repr(hook)), before, weight
-        )
-
-    log.info("Edge %s -> %s | final_weight=%.3f", u, v, weight)
-    return weight
+        weights = length * (1.0 + total_penalty)
+        return weights
 
 
-# ---------------------------------------------------------------------------
-# Built-in hook factory: temperature + length blend
-# ---------------------------------------------------------------------------
+    def neighbors(self, node_id: Any) -> list[tuple[Any, int, float]]:
+        """
+        Given a original node, use the adjacency list to return it's neighboring 
+        nodes and the edge cost to get there
 
-def make_temp_hook(
-    graph: nx.MultiDiGraph,
-    hour: int,
-    alpha: float = 0.5,
-    length_attr: str = "length",
-) -> WeightHook:
-    """
-    Return a hook that adjusts length using hourly temperature.
+        Return neighbors as:
+            (neighbor_node_id, edge_row, edge_cost)
+        
+        """
+        node_idx = self.node_to_idx[node_id]
 
-    The graph is scanned once to derive normalization ranges for:
-    - edge length
-    - temp_mean_{hour}
+        return [
+            (self.node_ids[neighbor_idx], edge_idx, self.edge_cost[edge_idx])
+            for neighbor_idx, edge_idx in self.adjacency[node_idx]
+        ]
 
-    alpha:
-      0.0 -> pure shortest distance
-      1.0 -> strongest temperature penalty
-    """
-    if not 0 <= hour <= 23:
-        raise ValueError(f"hour must be 0-23, got {hour}.")
-    if not 0.0 <= alpha <= 1.0:
-        raise ValueError(f"alpha must be in [0, 1], got {alpha}.")
+    def shortest_path(
+        self,
+        source_node_id: Any,
+        target_node_id: Any,
+        hour: int,
+    ) -> np.ndarray | None:
+        """
+         Basic weighted dijkstra implementation.
+         Adjusted from https://gist.github.com/potpath/b1cc6383e1116e895ac2ec891f666888
+        """
 
-    temp_attr = f"temp_mean_{hour}"
-    stats = _compute_temp_normalization_stats(
-        graph,
-        length_attr=length_attr,
-        temp_attr=temp_attr,
-    )
+        source = self.node_to_idx[source_node_id]
+        target = self.node_to_idx[target_node_id]
 
-    length_min = stats["length_min"]
-    length_max = stats["length_max"]
-    temp_min = stats["temp_min"]
-    temp_max = stats["temp_max"]
+        edge_weights = self.add_weights(["utci_category"], self.edge_cost, hour)
+        # keep track of shortest distance to all visited edges
+        visited = {source: 0.0}
 
-    def temp_hook(u: str, v: str, attrs: dict[str, Any], base_weight: float) -> float:
-        norm_length = _minmax_norm(base_weight, length_min, length_max)
+        # priority queue using heapq, which the node and it's associated weight/distance
+        h = [(0.0, source)]
 
-        raw_temp = attrs.get(temp_attr, temp_min)
-        temp = _safe_float(raw_temp, temp_min)
-        assert temp is not None
+        # keep track of all the previous nodes 
+        path = {}
 
-        norm_temp = _minmax_norm(temp, temp_min, temp_max)
+        # keep all the nodes that haven't been considered
+        nodes = set(range(self.n_nodes))
 
-        # Distance remains the backbone.
-        # Temperature adds a penalty scaled by alpha.
-        adjusted = base_weight * (1.0 + alpha * norm_temp)
+        # continue while there are still nodes to reach, dijkstra
+        while nodes and h:
+            current_weight, min_node = heapq.heappop(h)
+            try:
+                while min_node not in nodes:
+                    current_weight, min_node = heapq.heappop(h)
+            except IndexError:
+                break
 
-        log.info(
-            "temp_hook on %s -> %s | hour=%d | base_weight=%.3f | %s=%r | "
-            "norm_length=%.3f | norm_temp=%.3f | adjusted=%.3f",
-            u, v, hour, base_weight, temp_attr, raw_temp,
-            norm_length, norm_temp, adjusted
-        )
+            # min node has be processed
+            nodes.remove(min_node)
 
-        return max(adjusted, 1e-6)
+            # found path!
+            if min_node == target:
+                break
+            
+            # loop over all the neighbors of the current node and save the shortest path
+            for v, edge_idx in self.adjacency[min_node]:
+                weight = current_weight + edge_weights[edge_idx]
 
-    temp_hook.__name__ = f"temp_hook(hour={hour}, alpha={alpha})"
-    return temp_hook
+                if v not in visited or weight < visited[v]:
+                    visited[v] = weight
+                    heapq.heappush(h, (weight, v))
+                    path[v] = min_node
 
+        if target not in visited:
+            return None
 
-# ---------------------------------------------------------------------------
-# Core Dijkstra
-# ---------------------------------------------------------------------------
+        route = [target]
+        # reconstruct the original path through it's predecessor
+        while route[-1] != source:
+            route.append(path[route[-1]])
 
-def dijkstra(
-    graph: nx.MultiDiGraph,
-    source: str,
-    target: str,
-    weight: str = "length",
-    weight_hooks: list[WeightHook] | None = None,
-) -> list[str]:
-    """
-    Dijkstra's algorithm on a NetworkX MultiDiGraph.
-    """
-    if source not in graph:
-        raise nx.NodeNotFound(f"Source node {source!r} not in graph.")
-    if target not in graph:
-        raise nx.NodeNotFound(f"Target node {target!r} not in graph.")
+        route = np.array(route[::-1], dtype=np.int64)
 
-    hooks: list[WeightHook] = weight_hooks or []
-
-    log.info(
-        "Starting dijkstra | source=%s | target=%s | weight=%s | hooks=%s",
-        source,
-        target,
-        weight,
-        [getattr(h, "__name__", repr(h)) for h in hooks],
-    )
-
-    dist: dict[str, float] = {source: 0.0}
-    prev: dict[str, str | None] = {source: None}
-    heap: list[tuple[float, str]] = [(0.0, source)]
-    visited: set[str] = set()
-
-    while heap:
-        cost, u = heapq.heappop(heap)
-
-        if u in visited:
-            continue
-        visited.add(u)
-
-        log.info("Visiting node %s | current_cost=%.3f", u, cost)
-
-        if u == target:
-            log.info("Reached target %s with total_cost=%.3f", target, cost)
-            break
-
-        for v, edges in graph[u].items():
-            if v in visited:
-                continue
-
-            log.info("Considering edge %s -> %s", u, v)
-
-            edge_cost = _edge_weight(u, v, edges, weight, hooks)
-            new_cost = cost + edge_cost
-            old_cost = dist.get(v, math.inf)
-
-            log.info(
-                "Candidate path %s -> %s | edge_cost=%.3f | new_cost=%.3f | old_cost=%.3f",
-                u, v, edge_cost, new_cost, old_cost
-            )
-
-            if new_cost < old_cost:
-                dist[v] = new_cost
-                prev[v] = u
-                heapq.heappush(heap, (new_cost, v))
-
-                log.info(
-                    "Updated best path to %s | predecessor=%s | best_cost=%.3f",
-                    v, u, new_cost
-                )
-
-    if target not in dist:
-        raise nx.NetworkXNoPath(
-            f"No path found between {source!r} and {target!r}."
-        )
-
-    path: list[str] = []
-    node: str | None = target
-    while node is not None:
-        path.append(node)
-        node = prev.get(node)
-    path.reverse()
-
-    if path[0] != source:
-        raise nx.NetworkXNoPath(
-            f"Path reconstruction failed between {source!r} and {target!r}."
-        )
-
-    log.info("Final path: %s", path)
-    return path
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def shortest_path(
-    graph: nx.MultiDiGraph,
-    source: str,
-    target: str,
-    weight: str = "length",
-    weight_hooks: list[WeightHook] | None = None,
-) -> list[str]:
-    return dijkstra(graph, source, target, weight=weight, weight_hooks=weight_hooks)
+        return self.node_ids[route]
+    
+if __name__ == "__main__":
+    schema = NetworkSchema.from_folder("data/big_network")
+    routing_network = NumpyRoutingNetwork(schema)
+    print(routing_network.n_nodes)
+    print(routing_network.n_edges)

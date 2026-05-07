@@ -1,40 +1,27 @@
 """
-FastAPI server — serves a pedestrian street network at GET /route/network
-and computes shortest paths at POST /route/path.
+FastAPI server for the pedestrian routing prototype.
 
-The graph is loaded once on startup from a local GraphML file, then cached
-in memory for fast responses.
+The network is loaded once on startup from a persisted NetworkSchema folder:
 
-GET /route/network response shape:
-{
-    "geojson":    { "type": "FeatureCollection", "features": [...] },
-    "center":     [lon, lat],
-    "node_count": int,
-    "edge_count":  int
-}
+    network/
+    ├── nodes.parquet
+    ├── edges.parquet
+    └── metadata.json
 
-POST /route/path request shape:
-{
-    "origin":      { "lon": float, "lat": float },
-    "destination": { "lon": float, "lat": float }
-}
+Routing is intentionally fixed for this prototype:
 
-POST /route/path response shape:
-{
-    "geojson":    { "type": "FeatureCollection", "features": [...] },
-    "distance_m": float,
-    "duration_s": float   (None if no travel-time attribute available)
-}
+POST /route/path
+    Snap origin and destination coordinates to the nearest network nodes.
+    Select the requested hour from the hourly utci_category edge column.
+    Compute the route with NumpyRoutingNetwork.
 
-Usage
------
-pip install fastapi uvicorn networkx
+Run from the project root with:
 
-# Default path (expects big_network.graphml two levels above this file):
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
 
-# Custom path via env var:
-GRAPHML_PATH="/absolute/path/to/big_network.graphml" uvicorn main:app --port 8001
+Optional environment variables:
+
+    NETWORK_FOLDER=/absolute/path/to/network_folder
 """
 
 from __future__ import annotations
@@ -46,23 +33,24 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import networkx as nx
+import numpy as np
 from fastapi import FastAPI, HTTPException
-from api.routing import shortest_path, make_temp_hook, WeightHook
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from shapely.geometry import mapping
+
+from src.routing.routing import NumpyRoutingNetwork
+from src.schema import NetworkSchema
+
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
 
-# Default: <repo_root>/data/big_network.graphml
-_DEFAULT_GRAPHML = Path(__file__).resolve().parents[1] / "data" / "big_network.graphml"
-GRAPHML_PATH: Path = Path(os.getenv("GRAPHML_PATH", str(_DEFAULT_GRAPHML)))
+_DEFAULT_NETWORK_FOLDER = Path(__file__).resolve().parents[2] / "data" / "big_network"
+NETWORK_FOLDER = Path(os.getenv("NETWORK_FOLDER", str(_DEFAULT_NETWORK_FOLDER)))
+UTCI_CATEGORY_COL = "utci_category"
 
-# Edge attribute used as routing weight. Falls back to straight-line distance
-# if not present in the GraphML.
-WEIGHT_ATTR = os.getenv("ROUTE_WEIGHT", "length")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -71,231 +59,364 @@ WEIGHT_ATTR = os.getenv("ROUTE_WEIGHT", "length")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Global variables to use throughout
-# ---------------------------------------------------------------------------
-
-_network_payload: dict | None = None
-_graph: nx.MultiDiGraph | None = None          # kept in memory for routing
-_node_pos: dict[str, tuple[float, float]] = {} # node_id -> (lon, lat)
-
 
 # ---------------------------------------------------------------------------
-# Custom classes to keep track of route elements using pydantic (allows for minimal instanstiation)
+# Global application state
+# ---------------------------------------------------------------------------
+
+_schema: NetworkSchema | None = None
+_routing_network: NumpyRoutingNetwork | None = None
+_network_payload: dict[str, Any] | None = None
+_node_pos: dict[Any, tuple[float, float]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Request models
 # ---------------------------------------------------------------------------
 
 class Coordinate(BaseModel):
+    """A geographic coordinate in longitude/latitude order."""
+
     lon: float
     lat: float
 
+
 class RouteTime(BaseModel):
-    hour: int
+    """Hour used to select the UTCI category for each edge."""
+
+    hour: int = Field(..., ge=0, le=23)
+
 
 class RouteRequest(BaseModel):
+    """Request body for POST /route/path."""
+
     origin: Coordinate
     destination: Coordinate
     time: RouteTime
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# JSON and geometry helpers
 # ---------------------------------------------------------------------------
 
-def _clean_value(v: Any) -> Any:
-    """Sanitise a single property value for JSON serialisation."""
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+def _clean_value(value: Any) -> Any:
+    """Convert pandas/numpy/geopandas values into JSON-safe values."""
+    if value is None:
         return None
-    if isinstance(v, list):
-        return v[0] if len(v) == 1 else str(v)
-    if isinstance(v, bool):
-        return v
-    return v
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    if isinstance(value, np.ndarray):
+        return [_clean_value(v) for v in value.tolist()]
+
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return None
+
+    if isinstance(value, (list, tuple)):
+        return [_clean_value(v) for v in value]
+
+    if isinstance(value, dict):
+        return {str(k): _clean_value(v) for k, v in value.items()}
+
+    return value
 
 
-def _load_graphml(path: Path) -> nx.MultiDiGraph:
-    """Load a GraphML file into a NetworkX MultiDiGraph."""
-    log.info("Loading GraphML from %s …", path)
-    graph = nx.read_graphml(path, node_type=str, force_multigraph=True)
-    if not isinstance(graph, nx.MultiDiGraph):
-        graph = nx.MultiDiGraph(graph)
-    log.info("Loaded %d nodes / %d edges", graph.number_of_nodes(), graph.number_of_edges())
-    return graph
-
-
-def _build_payload(graph: nx.MultiDiGraph) -> tuple[dict, dict[str, tuple[float, float]]]:
+def _schema_to_wgs84(schema: NetworkSchema) -> NetworkSchema:
     """
-    Convert a NetworkX MultiDiGraph into the API payload and a node-position index.
+    Return a schema whose geometries are in EPSG:4326 when CRS information exists.
 
-    Returns (payload_dict, node_pos_dict).
+    The web client expects longitude/latitude coordinates. If the persisted
+    parquet files are already in EPSG:4326 or have no CRS, they are left as-is.
     """
-    # ------------------------------------------------------------------
-    # 1. Index node positions
-    # ------------------------------------------------------------------
-    node_pos: dict[str, tuple[float, float]] = {}
-    xs: list[float] = []
-    ys: list[float] = []
+    nodes = schema.nodes.copy()
+    edges = schema.edges.copy()
 
-    for node_id, attrs in graph.nodes(data=True):
-        try:
-            x = float(attrs["x"])   # longitude
-            y = float(attrs["y"])   # latitude
-        except (KeyError, TypeError, ValueError):
+    if nodes.crs is not None and nodes.crs.to_epsg() != 4326:
+        nodes = nodes.to_crs(4326)
+
+    if edges.crs is not None and edges.crs.to_epsg() != 4326:
+        edges = edges.to_crs(4326)
+
+    return NetworkSchema(
+        nodes=nodes,
+        edges=edges,
+        metadata=dict(schema.metadata),
+    )
+
+
+def _node_id_column(schema: NetworkSchema) -> str | None:
+    """Return the node-id column name if one exists; otherwise use the index."""
+    return "node_id" if "node_id" in schema.nodes.columns else None
+
+
+def _build_node_positions(schema: NetworkSchema) -> dict[Any, tuple[float, float]]:
+    """
+    Build a dictionary that maps original node IDs to (lon, lat) positions.
+
+    Geometry is preferred over x/y columns because geometries are reprojected by
+    _schema_to_wgs84, while x/y columns may still contain their original CRS.
+    """
+    nodes = schema.nodes
+    node_id_col = _node_id_column(schema)
+    node_pos: dict[Any, tuple[float, float]] = {}
+
+    for idx, row in nodes.iterrows():
+        node_id = row[node_id_col] if node_id_col is not None else idx
+
+        geom = row.geometry if "geometry" in nodes.columns else None
+        if geom is not None and not geom.is_empty:
+            node_pos[node_id] = (float(geom.x), float(geom.y))
             continue
-        node_pos[node_id] = (x, y)
-        xs.append(x)
-        ys.append(y)
 
-    if not xs:
-        raise ValueError(
-            "No node positions found — GraphML must have 'x' and 'y' node attributes."
-        )
+        if "x" in nodes.columns and "y" in nodes.columns:
+            node_pos[node_id] = (float(row["x"]), float(row["y"]))
 
-    center_lon = (min(xs) + max(xs)) / 2
-    center_lat = (min(ys) + max(ys)) / 2
+    if not node_pos:
+        raise ValueError("No node positions found. Expected node geometry or x/y columns.")
 
-    # ------------------------------------------------------------------
-    # 2. Build GeoJSON features from edges
-    # ------------------------------------------------------------------
+    return node_pos
+
+
+def _edge_properties(edge_row: Any, edge_row_idx: int) -> dict[str, Any]:
+    """Convert one edge row into JSON-safe GeoJSON feature properties."""
+    props: dict[str, Any] = {"edge_row": edge_row_idx}
+
+    for key, value in edge_row.items():
+        if key == "geometry":
+            continue
+        props[str(key)] = _clean_value(value)
+
+    return props
+
+
+def _edge_geometry(edge_row: Any, node_pos: dict[Any, tuple[float, float]]) -> dict[str, Any] | None:
+    """
+    Return a GeoJSON geometry for one edge row.
+
+    The stored edge geometry is preferred. If it is missing, a simple straight
+    line between the edge's u and v node positions is returned.
+    """
+    geom = edge_row.geometry if "geometry" in edge_row.index else None
+    if geom is not None and not geom.is_empty:
+        return mapping(geom)
+
+    src = node_pos.get(edge_row["u"])
+    dst = node_pos.get(edge_row["v"])
+    if src is None or dst is None:
+        return None
+
+    return {
+        "type": "LineString",
+        "coordinates": [list(src), list(dst)],
+    }
+
+
+def _edge_feature(
+    edge_row: Any,
+    edge_row_idx: int,
+    node_pos: dict[Any, tuple[float, float]],
+) -> dict[str, Any] | None:
+    """Convert one edge row into a GeoJSON Feature."""
+    geometry = _edge_geometry(edge_row, node_pos)
+    if geometry is None:
+        return None
+
+    return {
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": _edge_properties(edge_row, edge_row_idx),
+    }
+
+
+def _build_network_payload(
+    schema: NetworkSchema,
+    routing_network: NumpyRoutingNetwork,
+    node_pos: dict[Any, tuple[float, float]],
+) -> dict[str, Any]:
+    """Build the GET /route/network response from the persisted schema."""
     features: list[dict[str, Any]] = []
 
-    for u, v, _key, edge_attrs in graph.edges(data=True, keys=True):
-        src = node_pos.get(str(u))
-        dst = node_pos.get(str(v))
+    for edge_row_idx, edge_row in routing_network.edges.iterrows():
+        feature = _edge_feature(edge_row, edge_row_idx, node_pos)
+        if feature is not None:
+            features.append(feature)
 
-        if src is None or dst is None:
-            continue
+    xs = [coord[0] for coord in node_pos.values()]
+    ys = [coord[1] for coord in node_pos.values()]
 
-        geometry = {
-            "type": "LineString",
-            "coordinates": [list(src), list(dst)],
-        }
-
-        props: dict[str, Any] = {"u": u, "v": v, "key": _key, "edge_attrs": edge_attrs}
-        for k, val in edge_attrs.items():
-            props[k] = _clean_value(val)
-
-        features.append({"type": "Feature", "geometry": geometry, "properties": props})
-
-    log.info("Built GeoJSON with %d edge features.", len(features))
-
-    payload = {
-        "geojson": {"type": "FeatureCollection", "features": features},
-        "center": [round(center_lon, 6), round(center_lat, 6)],
-        "node_count": graph.number_of_nodes(),
-        "edge_count": graph.number_of_edges(),
+    return {
+        "geojson": {
+            "type": "FeatureCollection",
+            "features": features,
+        },
+        "center": [
+            round((min(xs) + max(xs)) / 2, 6),
+            round((min(ys) + max(ys)) / 2, 6),
+        ],
+        "node_count": routing_network.n_nodes,
+        "edge_count": routing_network.n_edges,
+        "metadata": _clean_value(schema.metadata),
     }
-    return payload, node_pos
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers
+# Spatial routing helpers
 # ---------------------------------------------------------------------------
 
 def _haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Great-circle distance in metres between two (lon, lat) points."""
-    R = 6_371_000.0
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    """Return great-circle distance in metres between two lon/lat coordinates."""
+    radius_m = 6_371_000.0
+
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
-    dlamb = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlamb / 2) ** 2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    dlambda = math.radians(lon2 - lon1)
 
-
-def _nearest_node(lon: float, lat: float) -> str:
-    """Return the node_id of the graph node closest to (lon, lat)."""
-    best_id = min(
-        _node_pos,
-        key=lambda nid: _haversine_m(lon, lat, _node_pos[nid][0], _node_pos[nid][1]),
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     )
-    return best_id
+
+    return radius_m * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def _path_to_geojson(
-    graph: nx.MultiDiGraph,
-    node_path: list[str],
-) -> tuple[dict, float, float | None]:
-    """
-    Convert a list of node IDs to a GeoJSON FeatureCollection of edge LineStrings.
+def _nearest_node(lon: float, lat: float) -> Any:
+    """Return the node ID closest to the given lon/lat coordinate."""
+    if not _node_pos:
+        raise RuntimeError("Node-position index is empty.")
 
-    Returns (geojson, total_distance_m, total_duration_s_or_None).
-    """
-    features: list[dict] = []
+    return min(
+        _node_pos,
+        key=lambda node_id: _haversine_m(
+            lon,
+            lat,
+            _node_pos[node_id][0],
+            _node_pos[node_id][1],
+        ),
+    )
+
+
+def _edge_rows_from_node_path(
+    routing_network: NumpyRoutingNetwork,
+    node_path: Any,
+) -> list[int]:
+    """Convert a returned node path into edge row indices."""
+    node_ids = np.asarray(node_path).tolist()
+    edge_rows: list[int] = []
+
+    for u_id, v_id in zip(node_ids[:-1], node_ids[1:]):
+        u_idx = routing_network.node_to_idx[u_id]
+        v_idx = routing_network.node_to_idx[v_id]
+
+        for neighbor_idx, edge_idx in routing_network.adjacency[u_idx]:
+            if neighbor_idx == v_idx:
+                edge_rows.append(int(edge_idx))
+                break
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not find edge between routed nodes {u_id!r} and {v_id!r}.",
+            )
+
+    return edge_rows
+
+
+def _route_to_geojson(
+    routing_network: NumpyRoutingNetwork,
+    edge_rows: list[int],
+) -> tuple[dict[str, Any], float, float | None]:
+    """Convert route edge row indices into route GeoJSON and summary statistics."""
+    features: list[dict[str, Any]] = []
     total_distance_m = 0.0
     total_duration_s: float | None = 0.0
 
-    for u, v in zip(node_path[:-1], node_path[1:]):
-        # Pick the lightest parallel edge (by WEIGHT_ATTR)
-        edges = graph[u][v]
-        best_key = min(
-            edges,
-            key=lambda k: float(edges[k].get(WEIGHT_ATTR, 1) or 1),
-        )
-        attrs = edges[best_key]
+    for edge_row_idx in edge_rows:
+        edge_row = routing_network.edges.iloc[edge_row_idx]
 
-        src = _node_pos.get(str(u))
-        dst = _node_pos.get(str(v))
-        if src is None or dst is None:
-            continue
+        feature = _edge_feature(edge_row, edge_row_idx, _node_pos)
+        if feature is not None:
+            features.append(feature)
 
-        seg_len = float(attrs.get("length") or 0) or _haversine_m(*src, *dst)
-        total_distance_m += seg_len
+        if "length" in routing_network.edges.columns:
+            length = _clean_value(edge_row["length"])
+            if length is not None:
+                total_distance_m += float(length)
 
-        # Duration — use travel_time if present, otherwise None
         if total_duration_s is not None:
-            travel_time = attrs.get("travel_time") or attrs.get("duration")
-            if travel_time is not None:
-                try:
-                    total_duration_s += float(travel_time)
-                except (TypeError, ValueError):
-                    total_duration_s = None
-            else:
+            duration = None
+            if "travel_time" in routing_network.edges.columns:
+                duration = edge_row["travel_time"]
+            elif "duration" in routing_network.edges.columns:
+                duration = edge_row["duration"]
+
+            duration = _clean_value(duration)
+            if duration is None:
                 total_duration_s = None
+            else:
+                total_duration_s += float(duration)
 
-        props: dict[str, Any] = {"u": u, "v": v}
-        for k, val in attrs.items():
-            props[k] = _clean_value(val)
+    return (
+        {"type": "FeatureCollection", "features": features},
+        total_distance_m,
+        total_duration_s,
+    )
 
-        features.append({
-            "type": "Feature",
-            "geometry": {
-                "type": "LineString",
-                "coordinates": [list(src), list(dst)],
-            },
-            "properties": props,
-        })
 
-    geojson = {"type": "FeatureCollection", "features": features}
-    return geojson, total_distance_m, total_duration_s
+def _route_cost(routing_network: NumpyRoutingNetwork, edge_rows: list[int], hour: int) -> float:
+    """Return the weighted cost for the selected route."""
+    weights = routing_network.add_weights([UTCI_CATEGORY_COL], routing_network.edge_cost, hour)
+    return float(np.sum(weights[edge_rows]))
+
+
+def _serialise_node_path(node_ids: Any) -> list[Any]:
+    """Convert a NumPy array of node IDs into a JSON-safe list."""
+    return [_clean_value(node_id) for node_id in np.asarray(node_ids).tolist()]
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — load once at startup
+# Lifespan: load the parquet network once at startup
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _network_payload, _graph, _node_pos
+    """Load NetworkSchema, build the routing network, and cache API payloads."""
+    global _schema, _routing_network, _network_payload, _node_pos
 
-    if not GRAPHML_PATH.exists():
-        log.error("GraphML file not found: %s", GRAPHML_PATH)
-        log.error("Set the GRAPHML_PATH environment variable to the correct path.")
+    if not NETWORK_FOLDER.exists():
+        log.error("Network folder not found: %s", NETWORK_FOLDER)
         yield
         return
 
     try:
-        graph = _load_graphml(GRAPHML_PATH)
-        payload, node_pos = _build_payload(graph)
+        log.info("Loading network schema from %s", NETWORK_FOLDER)
+        schema = NetworkSchema.from_folder(NETWORK_FOLDER)
+        schema = _schema_to_wgs84(schema)
 
-        # graph is stored in memory to use again for routing
-        _graph = graph
+        routing_network = NumpyRoutingNetwork(
+            schema=schema,
+            directed=False,
+        )
+
+        if UTCI_CATEGORY_COL not in routing_network.edges.columns:
+            raise ValueError(f"Edge table does not contain required column {UTCI_CATEGORY_COL!r}.")
+
+
+        node_pos = _build_node_positions(schema)
+        payload = _build_network_payload(schema, routing_network, node_pos)
+
+        _schema = schema
+        _routing_network = routing_network
         _node_pos = node_pos
         _network_payload = payload
 
         log.info(
-            "Network ready — center %s, %d features.",
-            _network_payload["center"],
-            len(_network_payload["geojson"]["features"]),
+            "Network ready: %d nodes / %d edges / %d GeoJSON features",
+            routing_network.n_nodes,
+            routing_network.n_edges,
+            len(payload["geojson"]["features"]),
         )
+
     except Exception as exc:
         log.error("Failed to load network: %s", exc, exc_info=True)
 
@@ -303,13 +424,13 @@ async def lifespan(app: FastAPI):
 
 
 # ---------------------------------------------------------------------------
-# App
+# FastAPI app
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="Temp Network API",
-    description="Serves a pedestrian street network (+ temperature data) as GeoJSON from a GraphML file.",
-    version="1.0.0",
+    title="Pedestrian Routing API",
+    description="Serves a parquet-based pedestrian network and computes UTCI-category routes.",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -326,111 +447,90 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 @app.get("/route/network", summary="Return the full pedestrian network as GeoJSON")
-async def get_network() -> dict:
+async def get_network() -> dict[str, Any]:
     """
-    Returns:
-    - **geojson**: GeoJSON FeatureCollection of network edges (LineStrings).
-    - **center**: `[longitude, latitude]` derived from the node bounding box.
-    - **node_count**: number of graph nodes.
-    - **edge_count**: number of graph edges.
+    Return the full edge network as a GeoJSON FeatureCollection.
+
+    Array-valued edge properties such as utci_category are returned as JSON lists.
+    The response also includes the map center, node count, edge count, and
+    persisted metadata from metadata.json.
     """
     if _network_payload is None:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Network data is not available. "
-                f"Check that GRAPHML_PATH points to a valid file (currently: {GRAPHML_PATH})."
-            ),
+            detail=f"Network is not available. Check NETWORK_FOLDER: {NETWORK_FOLDER}",
         )
+
     return _network_payload
 
 
-@app.post("/route/path", summary="Compute shortest path between two coordinates")
-async def post_route(body: RouteRequest) -> dict:
+@app.post("/route/path", summary="Compute a UTCI-aware route between two coordinates")
+async def post_route(body: RouteRequest) -> dict[str, Any]:
     """
-    Snaps both coordinates to the nearest graph nodes and returns the
-    shortest path (weighted by `ROUTE_WEIGHT`, default: `length`).
+    Snap origin and destination coordinates to the nearest network nodes and
+    compute a shortest path using only utci_category at the selected hour.
 
-    Request body:
+    Example request:
+
     ```json
     {
-        "origin":      { "lon": 4.47, "lat": 51.91 },
-        "destination": { "lon": 4.49, "lat": 51.93 }
-        "time": { "hour" : 10}
+      "origin": {"lon": 4.47, "lat": 51.91},
+      "destination": {"lon": 4.49, "lat": 51.93},
+      "time": {"hour": 10}
     }
     ```
-
-    Returns:
-    - **geojson**: GeoJSON FeatureCollection of the route edges.
-    - **distance_m**: total route length in metres.
-    - **duration_s**: travel time in seconds (null if not in graph data).
-    - **origin_node**: snapped origin node ID.
-    - **destination_node**: snapped destination node ID.
-    - **node_path**: ordered list of node IDs along the route.
     """
-    if _graph is None or not _node_pos:
+    if _routing_network is None:
         raise HTTPException(status_code=503, detail="Network not loaded.")
 
     origin_node = _nearest_node(body.origin.lon, body.origin.lat)
-    dest_node = _nearest_node(body.destination.lon, body.destination.lat)
+    destination_node = _nearest_node(body.destination.lon, body.destination.lat)
 
-    time = body.time.hour
-    WEIGHT_ATTR = f"temp_mean_{time}"
-
-    if origin_node == dest_node:
+    if origin_node == destination_node:
         raise HTTPException(
             status_code=400,
             detail="Origin and destination snap to the same node. Move the points further apart.",
         )
 
-    try:
+    hour = body.time.hour
 
-        # To add extra weight penalties, define hooks and pass them here:
-        # thsi can be used to add extra pentalties down the line.
-        """ 
-        def temperature_hook(u: str, v: str, attrs: dict, base_weight: float) -> float:
-            temp = attrs.get("temperature", 0)
-            return base_weight * (1 + 0.01 * temp)
+    node_path = _routing_network.shortest_path(
+        source_node_id=origin_node,
+        target_node_id=destination_node,
+        hour=hour,
+    )
 
-        weight_hooks: list[WeightHook] = [temperature_hook]
-        """
-        #   weight_hooks: list[WeightHook] = [my_hook]
-        # alpha gives the importance of the weight in [0-1]
-        weight_hooks = [make_temp_hook(_graph, hour=time, alpha=1)]  # time is already body.time.hour
-
-        node_path = shortest_path(
-            _graph,
-            source=origin_node,
-            target=dest_node,
-            weight="length",
-            weight_hooks=weight_hooks,
-        )
-    except nx.NetworkXNoPath:
+    if node_path is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No path found between nodes {origin_node} and {dest_node}.",
+            detail=f"No path found between nodes {origin_node!r} and {destination_node!r}.",
         )
-    except nx.NodeNotFound as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
 
-    geojson, distance_m, duration_s = _path_to_geojson(_graph, node_path)
+    edge_rows = _edge_rows_from_node_path(_routing_network, node_path)
+    geojson, distance_m, duration_s = _route_to_geojson(_routing_network, edge_rows)
 
     return {
         "geojson": geojson,
         "distance_m": round(distance_m, 2),
         "duration_s": round(duration_s, 1) if duration_s is not None else None,
-        "origin_node": origin_node,
-        "destination_node": dest_node,
-        "node_path": node_path,
+        "cost": round(_route_cost(_routing_network, edge_rows, hour), 3),
+        "weight_variable": UTCI_CATEGORY_COL,
+        "weight_hour": hour,
+        "origin_node": _clean_value(origin_node),
+        "destination_node": _clean_value(destination_node),
+        "node_path": _serialise_node_path(node_path),
+        "edge_rows": edge_rows,
     }
 
 
 @app.get("/health", summary="Health check")
-async def health() -> dict:
+async def health() -> dict[str, Any]:
+    """Return server status and network-loading information."""
     return {
         "status": "ok",
-        "network_loaded": _network_payload is not None,
-        "graphml_path": str(GRAPHML_PATH),
-        "node_count": _network_payload["node_count"] if _network_payload else None,
-        "edge_count": _network_payload["edge_count"] if _network_payload else None,
+        "network_loaded": _routing_network is not None,
+        "network_folder": str(NETWORK_FOLDER),
+        "routing_column": UTCI_CATEGORY_COL,
+        "node_count": _routing_network.n_nodes if _routing_network else None,
+        "edge_count": _routing_network.n_edges if _routing_network else None,
     }
