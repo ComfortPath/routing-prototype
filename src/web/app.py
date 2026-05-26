@@ -1,4 +1,4 @@
-"""Shiny app entry point for the UTCI network and route planner UI."""
+"""Shiny app entry point for the environmental network and route planner UI."""
 
 from shiny import App, ui
 from maplibre import output_maplibregl
@@ -29,7 +29,7 @@ app_ui = ui.page_sidebar(
             ui.output_text("hour_label"),
             ui.input_slider("hour", None, min=0, max=23, value=0, step=1, ticks=True),
             ui.hr(),
-            ui.h6("Selected-hour UTCI categories"),
+            ui.h6("Selected-hour UTCI median"),
             ui.output_ui("temp_stats"),
             ui.hr(),
             ui.h6("Colour scale range"),
@@ -51,7 +51,7 @@ app_ui = ui.page_sidebar(
             ui.h4("Route Planner"),
             ui.p(
                 "Click two points on the map to set your origin and destination, "
-                "then press the button below to request the route."
+                "then set how strongly UTCI category should influence routing."
             ),
             ui.hr(),
             ui.h6("Origin"),
@@ -62,10 +62,13 @@ app_ui = ui.page_sidebar(
             ui.h6("Time"),
             ui.output_text("time_label"),
             ui.input_slider("time", None, min=0, max=23, value=0, step=1, ticks=True),
+            ui.hr(),
+            ui.h6("Route preferences"),
+            ui.output_ui("weight_controls"),
             ui.input_action_button(
                 "find_route",
                 "Find Route",
-                class_="btn-primary w-100",
+                class_="btn-primary w-100 mt-2",
             ),
             ui.input_action_button(
                 "clear_points",
@@ -76,7 +79,7 @@ app_ui = ui.page_sidebar(
             ui.h6("Route result"),
             ui.output_ui("route_result"),
         ),
-        width=300,
+        width=330,
     ),
     output_maplibregl("map", height="100%"),
     title="UTCI Network Visualiser",
@@ -91,7 +94,7 @@ app_ui = ui.page_sidebar(
 app = App(app_ui, server)
 
 
-if __name__ == "__main__":
-    import uvicorn
+# if __name__ == "__main__":
+#     import uvicorn
 
-    uvicorn.run("web.app:app", host="0.0.0.0", port=8000, reload=True)
+#     uvicorn.run("web.app:app", host="0.0.0.0", port=8000, reload=True)

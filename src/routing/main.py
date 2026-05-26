@@ -8,16 +8,14 @@ The network is loaded once on startup from a persisted NetworkSchema folder:
     ├── edges.parquet
     └── metadata.json
 
-Routing is intentionally fixed for this prototype:
-
 POST /route/path
     Snap origin and destination coordinates to the nearest network nodes.
-    Select the requested hour from the hourly utci_category edge column.
+    Build a routing weight_config from the selected environmental variables.
     Compute the route with NumpyRoutingNetwork.
 
 Run from the project root with:
 
-    uvicorn src.main:app --host 0.0.0.0 --port 8001 --reload
+    uvicorn src.routing.main:app --host 0.0.0.0 --port 8001 --reload
 
 Optional environment variables:
 
@@ -47,9 +45,10 @@ from src.schema import NetworkSchema
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_NETWORK_FOLDER = Path(__file__).resolve().parents[2] / "data" / "big_network"
+_DEFAULT_NETWORK_FOLDER = Path(__file__).resolve().parents[2] / "data" / "network_final" / "red_bbox"
 NETWORK_FOLDER = Path(os.getenv("NETWORK_FOLDER", str(_DEFAULT_NETWORK_FOLDER)))
-UTCI_CATEGORY_COL = "utci_category"
+DEFAULT_WEIGHT_VARIABLE = "utci_category"
+UTCI_MEDIAN_VARIABLE = "utci_median"
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +67,7 @@ _schema: NetworkSchema | None = None
 _routing_network: NumpyRoutingNetwork | None = None
 _network_payload: dict[str, Any] | None = None
 _node_pos: dict[Any, tuple[float, float]] = {}
+_available_weight_variable_names: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -82,9 +82,31 @@ class Coordinate(BaseModel):
 
 
 class RouteTime(BaseModel):
-    """Hour used to select the UTCI category for each edge."""
+    """Hour used for selected hourly edge variables."""
 
     hour: int = Field(..., ge=0, le=23)
+
+
+class WeightVariable(BaseModel):
+    """One variable entry in the routing.py weight_config dictionary."""
+
+    name: str
+    w: float = Field(..., ge=0.0)
+    hour: int | None = Field(default=None, ge=0, le=23)
+    column: str | None = None
+    gamma_state_factor: float | None = Field(default=None, ge=0.0)
+    hot_categories: list[int] | None = None
+    counts_as_hot: bool | None = None
+    hot_threshold: float | None = None
+
+
+class WeightConfig(BaseModel):
+    """Routing.py-compatible weight configuration."""
+
+    variables: list[WeightVariable] = Field(default_factory=list)
+    hot_state_increment: int = Field(default=3, ge=0)
+    cold_state_recovery: int = Field(default=1, ge=0)
+    hot_edge_routing: bool | None = None
 
 
 class RouteRequest(BaseModel):
@@ -93,10 +115,11 @@ class RouteRequest(BaseModel):
     origin: Coordinate
     destination: Coordinate
     time: RouteTime
+    weight_config: WeightConfig | None = None
 
 
 # ---------------------------------------------------------------------------
-# JSON and geometry helpers
+# JSON, metadata, and geometry helpers
 # ---------------------------------------------------------------------------
 
 def _clean_value(value: Any) -> Any:
@@ -120,6 +143,13 @@ def _clean_value(value: Any) -> Any:
         return {str(k): _clean_value(v) for k, v in value.items()}
 
     return value
+
+
+def _model_to_dict(model: BaseModel) -> dict[str, Any]:
+    """Return a pydantic model as a dictionary for both pydantic v1 and v2."""
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)  # type: ignore[attr-defined]
+    return model.dict(exclude_none=True)
 
 
 def _schema_to_wgs84(schema: NetworkSchema) -> NetworkSchema:
@@ -176,6 +206,34 @@ def _build_node_positions(schema: NetworkSchema) -> dict[Any, tuple[float, float
         raise ValueError("No node positions found. Expected node geometry or x/y columns.")
 
     return node_pos
+
+
+def _build_available_weight_variables(
+    routing_network: NumpyRoutingNetwork,
+) -> list[dict[str, Any]]:
+    """Describe the fixed routing variable exposed to the front-end.
+
+    Routing intentionally uses only UTCI category. The variables are therefore
+    not derived from metadata.json anymore.
+    """
+    if DEFAULT_WEIGHT_VARIABLE not in routing_network.edges.columns:
+        log.warning(
+            "Routing variable %r is not present in the edge table and will not be exposed.",
+            DEFAULT_WEIGHT_VARIABLE,
+        )
+        return []
+
+    return [{
+        "name": DEFAULT_WEIGHT_VARIABLE,
+        "label": "UTCI category",
+        "hourly": True,
+        "hours": 24,
+        "default_selected": True,
+        "default_weight": 1.0,
+        "min_weight": 0.0,
+        "max_weight": 2.0,
+        "step": 0.1,
+    }]
 
 
 def _edge_properties(edge_row: Any, edge_row_idx: int) -> dict[str, Any]:
@@ -244,6 +302,7 @@ def _build_network_payload(
 
     xs = [coord[0] for coord in node_pos.values()]
     ys = [coord[1] for coord in node_pos.values()]
+    available_weight_variables = _build_available_weight_variables(routing_network)
 
     return {
         "geojson": {
@@ -257,7 +316,142 @@ def _build_network_payload(
         "node_count": routing_network.n_nodes,
         "edge_count": routing_network.n_edges,
         "metadata": _clean_value(schema.metadata),
+        "available_weight_variables": available_weight_variables,
     }
+
+
+# ---------------------------------------------------------------------------
+# Weight-config helpers
+# ---------------------------------------------------------------------------
+
+def _default_weight_config(hour: int) -> dict[str, Any]:
+    """Fallback config when a client does not send environmental preferences."""
+    return {"variables": []}
+
+
+def _utci_gamma(gamma_state_factor: float):
+    """Return the route-state sensitivity function used by routing.py."""
+    return lambda state, factor=gamma_state_factor: 1.0 + factor * state
+
+
+def _normalise_weight_variable(raw_variable: dict[str, Any], fallback_hour: int) -> dict[str, Any] | None:
+    """Validate and convert the fixed UTCI-category route variable."""
+    variable = dict(raw_variable)
+    name = variable.get("name")
+
+    if name != DEFAULT_WEIGHT_VARIABLE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Only {DEFAULT_WEIGHT_VARIABLE!r} can be used as a routing variable.",
+        )
+
+    if name not in _available_weight_variable_names:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Routing variable {DEFAULT_WEIGHT_VARIABLE!r} is not available in the edge table.",
+        )
+
+    weight = float(variable.get("w", 0.0))
+    if weight <= 0.0:
+        return None
+
+    hour = int(variable.get("hour", fallback_hour))
+    gamma_state_factor = float(variable.get("gamma_state_factor", 0.05) or 0.0)
+    hot_categories = variable.get("hot_categories") or [7, 8, 9]
+
+    return {
+        "name": DEFAULT_WEIGHT_VARIABLE,
+        "column": DEFAULT_WEIGHT_VARIABLE,
+        "w": weight,
+        "hour": hour,
+        "gamma": _utci_gamma(gamma_state_factor),
+        "gamma_state_factor": gamma_state_factor,
+        "hot_categories": [int(category) for category in hot_categories],
+    }
+
+
+def _request_weight_config(body: RouteRequest) -> dict[str, Any]:
+    """Convert the request body into the routing.py weight_config dictionary."""
+    hour = body.time.hour
+
+    if body.weight_config is None:
+        return _default_weight_config(hour)
+
+    config = _model_to_dict(body.weight_config)
+    normalised_variables: list[dict[str, Any]] = []
+
+    for raw_variable in config.get("variables", []):
+        variable = _normalise_weight_variable(raw_variable, fallback_hour=hour)
+        if variable is not None:
+            normalised_variables.append(variable)
+
+    if not normalised_variables:
+        return {"variables": []}
+
+    return {
+        "variables": normalised_variables,
+        "hot_state_increment": int(config.get("hot_state_increment", 3)),
+        "cold_state_recovery": int(config.get("cold_state_recovery", 1)),
+        "hot_edge_routing": bool(config.get("hot_edge_routing", True)),
+    }
+
+
+def _prepare_weight_config(
+    routing_network: NumpyRoutingNetwork,
+    weight_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach extracted edge arrays so add_weight can evaluate a route."""
+    prepared = {
+        **weight_config,
+        "variables": [dict(variable) for variable in weight_config.get("variables", [])],
+    }
+
+    for variable in prepared["variables"]:
+        variable["_values"] = routing_network.extract_edge_values(
+            column=variable.get("column", variable["name"]),
+            hour=variable.get("hour"),
+        )
+
+    return prepared
+
+
+def _route_cost(
+    routing_network: NumpyRoutingNetwork,
+    edge_rows: list[int],
+    weight_config: dict[str, Any],
+) -> float:
+    """Return the dynamic weighted route cost for the selected edge sequence."""
+    prepared_config = _prepare_weight_config(routing_network, weight_config)
+    route_state = 0
+    total_cost = 0.0
+
+    for edge_row in edge_rows:
+        edge_cost, route_state = routing_network.add_weight(
+            edge_idx=edge_row,
+            weight_config=prepared_config,
+            route_state=route_state,
+        )
+        total_cost += edge_cost
+
+    return float(total_cost)
+
+
+def _serialisable_weight_config(weight_config: dict[str, Any]) -> dict[str, Any]:
+    """Remove internal arrays/callables before returning config to the client."""
+    clean_config = {
+        **weight_config,
+        "variables": [],
+    }
+
+    for variable in weight_config.get("variables", []):
+        clean_variable = {
+            key: value
+            for key, value in variable.items()
+            if key != "_values" and not callable(value)
+        }
+        clean_config["variables"].append(_clean_value(clean_variable))
+
+    return _clean_value(clean_config)
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +516,46 @@ def _edge_rows_from_node_path(
     return edge_rows
 
 
+def _hourly_edge_value(edge_row: Any, column: str, hour: int) -> float | None:
+    """Return a scalar or selected-hour edge value as a float."""
+    if column not in edge_row.index:
+        return None
+
+    value = edge_row[column]
+    if value is None:
+        return None
+
+    try:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+    if arr.size == 0:
+        return None
+
+    if arr.size == 1:
+        selected = arr[0]
+    elif hour < arr.size:
+        selected = arr[hour]
+    else:
+        return None
+
+    if math.isnan(float(selected)) or math.isinf(float(selected)):
+        return None
+    return float(selected)
+
+
 def _route_to_geojson(
     routing_network: NumpyRoutingNetwork,
     edge_rows: list[int],
-) -> tuple[dict[str, Any], float, float | None]:
+    hour: int,
+) -> tuple[dict[str, Any], float, float | None, float | None]:
     """Convert route edge row indices into route GeoJSON and summary statistics."""
     features: list[dict[str, Any]] = []
     total_distance_m = 0.0
     total_duration_s: float | None = 0.0
+    weighted_utci_sum = 0.0
+    utci_weight_sum = 0.0
 
     for edge_row_idx in edge_rows:
         edge_row = routing_network.edges.iloc[edge_row_idx]
@@ -338,10 +564,17 @@ def _route_to_geojson(
         if feature is not None:
             features.append(feature)
 
+        length = None
         if "length" in routing_network.edges.columns:
             length = _clean_value(edge_row["length"])
             if length is not None:
                 total_distance_m += float(length)
+
+        utci_median = _hourly_edge_value(edge_row, UTCI_MEDIAN_VARIABLE, hour)
+        if utci_median is not None:
+            length_weight = float(length) if length is not None and float(length) > 0 else 1.0
+            weighted_utci_sum += utci_median * length_weight
+            utci_weight_sum += length_weight
 
         if total_duration_s is not None:
             duration = None
@@ -356,17 +589,18 @@ def _route_to_geojson(
             else:
                 total_duration_s += float(duration)
 
+    average_utci_median = (
+        weighted_utci_sum / utci_weight_sum
+        if utci_weight_sum > 0.0
+        else None
+    )
+
     return (
         {"type": "FeatureCollection", "features": features},
         total_distance_m,
         total_duration_s,
+        average_utci_median,
     )
-
-
-def _route_cost(routing_network: NumpyRoutingNetwork, edge_rows: list[int], hour: int) -> float:
-    """Return the weighted cost for the selected route."""
-    weights = routing_network.add_weights([UTCI_CATEGORY_COL], routing_network.edge_cost, hour)
-    return float(np.sum(weights[edge_rows]))
 
 
 def _serialise_node_path(node_ids: Any) -> list[Any]:
@@ -381,7 +615,7 @@ def _serialise_node_path(node_ids: Any) -> list[Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load NetworkSchema, build the routing network, and cache API payloads."""
-    global _schema, _routing_network, _network_payload, _node_pos
+    global _schema, _routing_network, _network_payload, _node_pos, _available_weight_variable_names
 
     if not NETWORK_FOLDER.exists():
         log.error("Network folder not found: %s", NETWORK_FOLDER)
@@ -398,23 +632,25 @@ async def lifespan(app: FastAPI):
             directed=False,
         )
 
-        if UTCI_CATEGORY_COL not in routing_network.edges.columns:
-            raise ValueError(f"Edge table does not contain required column {UTCI_CATEGORY_COL!r}.")
-
-
         node_pos = _build_node_positions(schema)
         payload = _build_network_payload(schema, routing_network, node_pos)
+        available_names = {
+            variable["name"]
+            for variable in payload.get("available_weight_variables", [])
+        }
 
         _schema = schema
         _routing_network = routing_network
         _node_pos = node_pos
         _network_payload = payload
+        _available_weight_variable_names = available_names
 
         log.info(
-            "Network ready: %d nodes / %d edges / %d GeoJSON features",
+            "Network ready: %d nodes / %d edges / %d GeoJSON features / weight variables: %s",
             routing_network.n_nodes,
             routing_network.n_edges,
             len(payload["geojson"]["features"]),
+            sorted(available_names),
         )
 
     except Exception as exc:
@@ -429,8 +665,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Pedestrian Routing API",
-    description="Serves a parquet-based pedestrian network and computes UTCI-category routes.",
-    version="2.1.0",
+    description="Serves a parquet-based pedestrian network and computes configurable weighted routes.",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -451,9 +687,9 @@ async def get_network() -> dict[str, Any]:
     """
     Return the full edge network as a GeoJSON FeatureCollection.
 
-    Array-valued edge properties such as utci_category are returned as JSON lists.
-    The response also includes the map center, node count, edge count, and
-    persisted metadata from metadata.json.
+    Array-valued edge properties such as utci_category and utci_median are
+    returned as JSON lists. The response also includes the fixed routing
+    variable used by the front-end.
     """
     if _network_payload is None:
         raise HTTPException(
@@ -464,11 +700,11 @@ async def get_network() -> dict[str, Any]:
     return _network_payload
 
 
-@app.post("/route/path", summary="Compute a UTCI-aware route between two coordinates")
+@app.post("/route/path", summary="Compute a configurable weighted route between two coordinates")
 async def post_route(body: RouteRequest) -> dict[str, Any]:
     """
     Snap origin and destination coordinates to the nearest network nodes and
-    compute a shortest path using only utci_category at the selected hour.
+    compute a shortest path using the supplied routing.py weight_config.
 
     Example request:
 
@@ -476,7 +712,12 @@ async def post_route(body: RouteRequest) -> dict[str, Any]:
     {
       "origin": {"lon": 4.47, "lat": 51.91},
       "destination": {"lon": 4.49, "lat": 51.93},
-      "time": {"hour": 10}
+      "time": {"hour": 10},
+      "weight_config": {
+        "variables": [
+          {"name": "utci_category", "column": "utci_category", "w": 1.0, "hour": 10}
+        ]
+      }
     }
     ```
     """
@@ -492,12 +733,12 @@ async def post_route(body: RouteRequest) -> dict[str, Any]:
             detail="Origin and destination snap to the same node. Move the points further apart.",
         )
 
-    hour = body.time.hour
+    weight_config = _request_weight_config(body)
 
     node_path = _routing_network.shortest_path(
         source_node_id=origin_node,
         target_node_id=destination_node,
-        hour=hour,
+        weight_config=weight_config,
     )
 
     if node_path is None:
@@ -507,15 +748,23 @@ async def post_route(body: RouteRequest) -> dict[str, Any]:
         )
 
     edge_rows = _edge_rows_from_node_path(_routing_network, node_path)
-    geojson, distance_m, duration_s = _route_to_geojson(_routing_network, edge_rows)
+    geojson, distance_m, duration_s, average_utci_median = _route_to_geojson(
+        _routing_network,
+        edge_rows,
+        body.time.hour,
+    )
+    route_cost = _route_cost(_routing_network, edge_rows, weight_config)
 
     return {
         "geojson": geojson,
         "distance_m": round(distance_m, 2),
         "duration_s": round(duration_s, 1) if duration_s is not None else None,
-        "cost": round(_route_cost(_routing_network, edge_rows, hour), 3),
-        "weight_variable": UTCI_CATEGORY_COL,
-        "weight_hour": hour,
+        "cost": round(route_cost, 3),
+        "average_utci_median": round(average_utci_median, 2) if average_utci_median is not None else None,
+        "average_median_utci": round(average_utci_median, 2) if average_utci_median is not None else None,
+        "weight_config": _serialisable_weight_config(weight_config),
+        "weight_variables": [variable["name"] for variable in weight_config.get("variables", [])],
+        "weight_hour": body.time.hour,
         "origin_node": _clean_value(origin_node),
         "destination_node": _clean_value(destination_node),
         "node_path": _serialise_node_path(node_path),
@@ -530,7 +779,7 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "network_loaded": _routing_network is not None,
         "network_folder": str(NETWORK_FOLDER),
-        "routing_column": UTCI_CATEGORY_COL,
+        "available_weight_variables": sorted(_available_weight_variable_names),
         "node_count": _routing_network.n_nodes if _routing_network else None,
         "edge_count": _routing_network.n_edges if _routing_network else None,
     }

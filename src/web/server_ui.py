@@ -23,11 +23,82 @@ from src.web.api_client import fetch_network, fetch_route
 
 HOURS = list(range(24))
 UTCI_CATEGORY_VARIABLE = "utci_category"
+UTCI_MEDIAN_VARIABLE = "utci_median"
+HOT_EDGE_GAMMA_STATE_FACTOR = 0.05
 NETWORK_LAYER_ID = "network-edges"
 ROUTE_LAYER_ID = "route-path"
 MARKER_LAYER_ID = "route-markers"
 FALLBACK_CENTER = (4.48, 51.92)  # Rotterdam-ish default
 EMPTY_GEOJSON: dict = {"type": "FeatureCollection", "features": []}
+
+
+# ---------------------------------------------------------------------------
+# Routing preference helpers
+# ---------------------------------------------------------------------------
+
+def _variable_label(variable_name: str) -> str:
+    """Return a readable label for the fixed routing variable."""
+    if variable_name == UTCI_CATEGORY_VARIABLE:
+        return "UTCI category"
+    return variable_name.replace("_", " ").title()
+
+
+def weight_controls_ui() -> Any:
+    """Build the fixed route-preference controls.
+
+    Routing uses only UTCI category. UTCI median is still used for map colouring
+    and route reporting, but not as a routing weight.
+    """
+    return ui.div(
+        ui.p(
+            "Routing uses UTCI category only. Set importance to 0 for the "
+            "ordinary shortest path.",
+            style="font-size: 0.9em; color: #aaa;",
+        ),
+        ui.input_slider(
+            "weight_utci_category",
+            "UTCI category importance",
+            min=0.0,
+            max=2.0,
+            value=1.0,
+            step=0.1,
+        ),
+        ui.input_checkbox(
+            "use_hot_edge_routing",
+            "Avoid consecutive hot edges",
+            value=True,
+        ),
+        ui.p(
+            "When disabled, the route still uses the UTCI category penalty, "
+            "but it does not add extra penalty after consecutive hot edges.",
+            style="font-size: 0.8em; color: #888; margin-top: -0.25rem;",
+        ),
+    )
+
+
+def build_weight_config(input, selected_hour: int) -> dict[str, Any]:
+    """Build the routing.py weight_config dictionary from route-sidebar inputs."""
+    importance = float(input.weight_utci_category() or 0.0)
+    if importance <= 0.0:
+        return {"variables": []}
+
+    use_hot_edge_routing = bool(input.use_hot_edge_routing())
+
+    return {
+        "variables": [
+            {
+                "name": UTCI_CATEGORY_VARIABLE,
+                "column": UTCI_CATEGORY_VARIABLE,
+                "w": importance,
+                "hour": int(selected_hour),
+                "gamma_state_factor": HOT_EDGE_GAMMA_STATE_FACTOR if use_hot_edge_routing else 0.0,
+                "hot_categories": [7, 8, 9],
+            }
+        ],
+        "hot_state_increment": 3 if use_hot_edge_routing else 0,
+        "cold_state_recovery": 1 if use_hot_edge_routing else 0,
+        "hot_edge_routing": use_hot_edge_routing,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +124,7 @@ def _hourly_value(props: dict, variable: str, hour: int) -> float | None:
 
     The expected API property shape is:
 
-        {"utci_category": [value_00, value_01, ..., value_23]}
+        {"utci_median": [value_00, value_01, ..., value_23]}
     """
     values = props.get(variable)
 
@@ -247,6 +318,29 @@ def _marker_geojson(
     return {"type": "FeatureCollection", "features": features}
 
 
+def _route_preference_summary(weight_config: dict[str, Any]) -> str:
+    """Return a compact text summary of selected route preference sliders."""
+    variables = weight_config.get("variables", [])
+    if not variables:
+        return "Shortest path: no environmental variables selected."
+
+    parts = []
+    for variable in variables:
+        name = variable.get("name", "unknown")
+        weight = variable.get("w", 0)
+        hour = variable.get("hour")
+        label = _variable_label(name)
+        if hour is None:
+            parts.append(f"{label} × {float(weight):.1f}")
+        else:
+            parts.append(f"{label}[{int(hour):02d}:00] × {float(weight):.1f}")
+
+    hot_edge_routing = bool(weight_config.get("hot_edge_routing", False))
+    parts.append("hot-edge routing on" if hot_edge_routing else "hot-edge routing off")
+
+    return "Routing preferences: " + ", ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Shiny server
 # ---------------------------------------------------------------------------
@@ -265,11 +359,18 @@ def server(input, output, session):
 
     @reactive.Calc
     def hour_stats_data() -> dict[int, dict[str, float]]:
-        """Compute hourly stats for the fixed UTCI category variable."""
+        """Compute hourly stats for the UTCI median display variable."""
         data = network_data()
         if data is None:
             return {}
-        return build_hour_stats(data, UTCI_CATEGORY_VARIABLE)
+        return build_hour_stats(data, UTCI_MEDIAN_VARIABLE)
+
+    @reactive.Calc
+    def selected_map_hour() -> int:
+        """Use the visible hour slider for the active app mode."""
+        if input.app_mode() == "route":
+            return int(input.time())
+        return int(input.hour())
 
     # ── Load network ──────────────────────────────────────────────────────────
 
@@ -302,7 +403,7 @@ def server(input, output, session):
 
             if stats:
                 bounds = scale_bounds(0, "per_hour", stats)
-                geojson = geojson_for_hour(data, 0, UTCI_CATEGORY_VARIABLE)
+                geojson = geojson_for_hour(data, 0, UTCI_MEDIAN_VARIABLE)
                 line_color = color_expression(*bounds) if bounds else "#4da3ff"
             else:
                 geojson = data.get("geojson", EMPTY_GEOJSON)
@@ -320,8 +421,9 @@ def server(input, output, session):
         stats = hour_stats_data()
 
         if stats:
-            geojson = geojson_for_hour(data, input.hour(), UTCI_CATEGORY_VARIABLE)
-            bounds = scale_bounds(input.hour(), input.norm_mode(), stats)
+            hour = selected_map_hour()
+            geojson = geojson_for_hour(data, hour, UTCI_MEDIAN_VARIABLE)
+            bounds = scale_bounds(hour, input.norm_mode(), stats)
             line_color = color_expression(*bounds) if bounds else "#4da3ff"
         else:
             geojson = data.get("geojson", EMPTY_GEOJSON)
@@ -390,6 +492,7 @@ def server(input, output, session):
             return
 
         selected_hour = int(input.time())
+        weight_config = build_weight_config(input, selected_hour)
         route_request_time.set(selected_hour)
         route_error.set(None)
         route_loading.set(True)
@@ -399,8 +502,10 @@ def server(input, output, session):
                 origin,
                 dest,
                 selected_hour,
+                weight_config=weight_config,
             )
             result["requested_hour"] = selected_hour
+            result["requested_weight_config"] = weight_config
             route_result_data.set(result)
 
             async with MapContext("map") as m:
@@ -444,10 +549,10 @@ def server(input, output, session):
 
         stats = hour_stats_data()
         hour = input.hour()
-        variable = UTCI_CATEGORY_VARIABLE
+        variable = UTCI_MEDIAN_VARIABLE
 
         if not stats or hour not in stats:
-            return ui.p(f"No hourly UTCI category property named {variable!r} is exposed by the API.")
+            return ui.p(f"No hourly UTCI median property named {variable!r} is exposed by the API.")
 
         s = stats[hour]
         return ui.layout_columns(
@@ -464,12 +569,22 @@ def server(input, output, session):
 
         bounds = scale_bounds(input.hour(), input.norm_mode(), hour_stats_data())
         if bounds is None:
-            return ui.p("Hourly UTCI category data unavailable from API.")
+            return ui.p("Hourly UTCI median data unavailable from API.")
 
         lo, _, hi = bounds
-        return ui.p(f"{lo:.1f} (blue)  ->  {hi:.1f} (red)")
+        return ui.p(f"{lo:.1f} °C (blue)  ->  {hi:.1f} °C (red)")
 
     # ── Route planner sidebar outputs ─────────────────────────────────────────
+
+    @render.ui
+    def weight_controls():
+        if load_error() is not None:
+            return ui.p("Route preferences unavailable because the network failed to load.")
+
+        if network_data() is None:
+            return ui.p("Loading route preferences...")
+
+        return weight_controls_ui()
 
     @render.ui
     def origin_display():
@@ -508,29 +623,24 @@ def server(input, output, session):
             return ui.p(ui.em("No route yet."), style="color: #888;")
 
         distance_m = result.get("distance_m")
-        duration_s = result.get("duration_s")
-        cost = result.get("cost")
-        variable = result.get("weight_variable", UTCI_CATEGORY_VARIABLE)
-        hour = result.get("weight_hour")
+        avg_utci_median = result.get("average_utci_median")
+        if avg_utci_median is None:
+            avg_utci_median = result.get("average_median_utci")
+        returned_config = result.get("weight_config") or result.get("requested_weight_config") or {}
 
         parts = []
         if distance_m is not None:
             parts.append(ui.value_box("Distance", f"{distance_m / 1000:.2f} km"))
-        if cost is not None:
-            parts.append(ui.value_box("Route cost", f"{cost:.2f}"))
+        if avg_utci_median is not None:
+            parts.append(ui.value_box("Avg. median UTCI", f"{avg_utci_median:.1f} °C"))
 
         detail = ui.p(
-            f"UTCI routing: {variable}[{hour}]" if hour is not None else f"UTCI routing: {variable}",
+            _route_preference_summary(returned_config),
             style="font-size: 0.9em; color: #aaa; margin-top: 0.5rem;",
         )
 
-        if duration_s is not None:
-            mins = int(duration_s // 60)
-            secs = int(duration_s % 60)
-            parts.append(ui.value_box("Duration", f"{mins}m {secs:02d}s"))
-
         if not parts:
-            return ui.div(ui.p("Route received — no distance/cost in response."), detail)
+            return ui.div(ui.p("Route received — no distance or UTCI summary in response."), detail)
 
         return ui.div(
             ui.layout_columns(*parts, col_widths=[6] * min(len(parts), 2)),
