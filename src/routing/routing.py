@@ -321,7 +321,7 @@ class NumpyRoutingNetwork:
         return self.node_ids[route]
     
 if __name__ == "__main__":
-    schema = NetworkSchema.from_folder("data/network_final/red_bbox")
+    schema = NetworkSchema.from_folder("data/network_final")
     routing_network = NumpyRoutingNetwork(schema)
     weight_config = {
         "variables": [

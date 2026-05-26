@@ -1,4 +1,4 @@
-"""Shiny app entry point for the environmental network and route planner UI."""
+"""Shiny app entry point for the thermally conscious route planner."""
 
 from shiny import App, ui
 from maplibre import output_maplibregl
@@ -12,77 +12,46 @@ from src.web.server_ui import server
 
 app_ui = ui.page_sidebar(
     ui.sidebar(
-        ui.input_radio_buttons(
-            "app_mode",
-            None,
-            choices={"network": "🌡  UTCI Network", "route": "🗺  Route Planner"},
-            selected="network",
-            inline=True,
+        ui.p(
+            "Click two points on the map, choose the routing hour, and calculate "
+            "a route!"
         ),
         ui.hr(),
-
-        ui.panel_conditional(
-            "input.app_mode === 'network'",
-            ui.h4("UTCI Network"),
-            ui.p("Pedestrian network fetched from the parquet-based API."),
-            ui.h6("Hour"),
-            ui.output_text("hour_label"),
-            ui.input_slider("hour", None, min=0, max=23, value=0, step=1, ticks=True),
-            ui.hr(),
-            ui.h6("Selected-hour UTCI median"),
-            ui.output_ui("temp_stats"),
-            ui.hr(),
-            ui.h6("Colour scale range"),
-            ui.output_ui("scale_range"),
-            ui.h6("Normalisation"),
-            ui.input_radio_buttons(
-                "norm_mode",
-                None,
-                choices={"per_hour": "Per hour", "global": "Global (all hours)"},
-                selected="per_hour",
-            ),
-            ui.hr(),
-            ui.h6("Network"),
-            ui.output_ui("network_stats"),
-        ),
-
-        ui.panel_conditional(
-            "input.app_mode === 'route'",
-            ui.h4("Route Planner"),
-            ui.p(
-                "Click two points on the map to set your origin and destination, "
-                "then set how strongly UTCI category should influence routing."
-            ),
-            ui.hr(),
-            ui.h6("Origin"),
-            ui.output_ui("origin_display"),
-            ui.h6("Destination"),
-            ui.output_ui("destination_display"),
-            ui.hr(),
-            ui.h6("Time"),
-            ui.output_text("time_label"),
-            ui.input_slider("time", None, min=0, max=23, value=0, step=1, ticks=True),
-            ui.hr(),
-            ui.h6("Route preferences"),
-            ui.output_ui("weight_controls"),
+        ui.h6("Route points"),
+        ui.output_ui("locations_display"),
+        ui.hr(),
+        ui.h6("Time"),
+        ui.output_text("time_label"),
+        ui.input_slider("time", None, min=0, max=23, value=0, step=1, ticks=True),
+        ui.output_ui("time_gradient"),
+        ui.hr(),
+        ui.h6("Route preferences"),
+        ui.output_ui("weight_controls"),
+        ui.layout_columns(
             ui.input_action_button(
                 "find_route",
                 "Find Route",
-                class_="btn-primary w-100 mt-2",
+                class_="btn-primary w-100",
             ),
             ui.input_action_button(
                 "clear_points",
                 "Clear Points",
-                class_="btn-outline-secondary w-100 mt-2",
+                class_="btn-outline-secondary w-100",
             ),
-            ui.hr(),
-            ui.h6("Route result"),
-            ui.output_ui("route_result"),
-        ),
-        width=330,
+            col_widths=[6, 6],
+            gap="0.5rem",
+        ),  
+        ui.hr(),
+        ui.h6("Route result"),
+        ui.output_ui("route_result"),
+        ui.hr(),
+        ui.h6("Network Stats"),
+        ui.output_ui("stats"),
+        width=330
+        
     ),
     output_maplibregl("map", height="100%"),
-    title="UTCI Network Visualiser",
+    title="UTCI Route Planner",
     fillable=True,
 )
 
@@ -92,9 +61,3 @@ app_ui = ui.page_sidebar(
 # ---------------------------------------------------------------------------
 
 app = App(app_ui, server)
-
-
-# if __name__ == "__main__":
-#     import uvicorn
-
-#     uvicorn.run("web.app:app", host="0.0.0.0", port=8000, reload=True)

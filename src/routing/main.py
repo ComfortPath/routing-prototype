@@ -63,11 +63,9 @@ log = logging.getLogger(__name__)
 # Global application state
 # ---------------------------------------------------------------------------
 
-_schema: NetworkSchema | None = None
 _routing_network: NumpyRoutingNetwork | None = None
 _network_payload: dict[str, Any] | None = None
 _node_pos: dict[Any, tuple[float, float]] = {}
-_available_weight_variable_names: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +94,6 @@ class WeightVariable(BaseModel):
     column: str | None = None
     gamma_state_factor: float | None = Field(default=None, ge=0.0)
     hot_categories: list[int] | None = None
-    counts_as_hot: bool | None = None
-    hot_threshold: float | None = None
 
 
 class WeightConfig(BaseModel):
@@ -208,34 +204,6 @@ def _build_node_positions(schema: NetworkSchema) -> dict[Any, tuple[float, float
     return node_pos
 
 
-def _build_available_weight_variables(
-    routing_network: NumpyRoutingNetwork,
-) -> list[dict[str, Any]]:
-    """Describe the fixed routing variable exposed to the front-end.
-
-    Routing intentionally uses only UTCI category. The variables are therefore
-    not derived from metadata.json anymore.
-    """
-    if DEFAULT_WEIGHT_VARIABLE not in routing_network.edges.columns:
-        log.warning(
-            "Routing variable %r is not present in the edge table and will not be exposed.",
-            DEFAULT_WEIGHT_VARIABLE,
-        )
-        return []
-
-    return [{
-        "name": DEFAULT_WEIGHT_VARIABLE,
-        "label": "UTCI category",
-        "hourly": True,
-        "hours": 24,
-        "default_selected": True,
-        "default_weight": 1.0,
-        "min_weight": 0.0,
-        "max_weight": 2.0,
-        "step": 0.1,
-    }]
-
-
 def _edge_properties(edge_row: Any, edge_row_idx: int) -> dict[str, Any]:
     """Convert one edge row into JSON-safe GeoJSON feature properties."""
     props: dict[str, Any] = {"edge_row": edge_row_idx}
@@ -302,8 +270,6 @@ def _build_network_payload(
 
     xs = [coord[0] for coord in node_pos.values()]
     ys = [coord[1] for coord in node_pos.values()]
-    available_weight_variables = _build_available_weight_variables(routing_network)
-
     return {
         "geojson": {
             "type": "FeatureCollection",
@@ -316,7 +282,6 @@ def _build_network_payload(
         "node_count": routing_network.n_nodes,
         "edge_count": routing_network.n_edges,
         "metadata": _clean_value(schema.metadata),
-        "available_weight_variables": available_weight_variables,
     }
 
 
@@ -324,8 +289,8 @@ def _build_network_payload(
 # Weight-config helpers
 # ---------------------------------------------------------------------------
 
-def _default_weight_config(hour: int) -> dict[str, Any]:
-    """Fallback config when a client does not send environmental preferences."""
+def _default_weight_config() -> dict[str, Any]:
+    """Return shortest-path routing config when no preferences are supplied."""
     return {"variables": []}
 
 
@@ -345,7 +310,7 @@ def _normalise_weight_variable(raw_variable: dict[str, Any], fallback_hour: int)
             detail=f"Only {DEFAULT_WEIGHT_VARIABLE!r} can be used as a routing variable.",
         )
 
-    if name not in _available_weight_variable_names:
+    if _routing_network is None or DEFAULT_WEIGHT_VARIABLE not in _routing_network.edges.columns:
         raise HTTPException(
             status_code=422,
             detail=f"Routing variable {DEFAULT_WEIGHT_VARIABLE!r} is not available in the edge table.",
@@ -375,7 +340,7 @@ def _request_weight_config(body: RouteRequest) -> dict[str, Any]:
     hour = body.time.hour
 
     if body.weight_config is None:
-        return _default_weight_config(hour)
+        return _default_weight_config()
 
     config = _model_to_dict(body.weight_config)
     normalised_variables: list[dict[str, Any]] = []
@@ -615,7 +580,7 @@ def _serialise_node_path(node_ids: Any) -> list[Any]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load NetworkSchema, build the routing network, and cache API payloads."""
-    global _schema, _routing_network, _network_payload, _node_pos, _available_weight_variable_names
+    global _routing_network, _network_payload, _node_pos
 
     if not NETWORK_FOLDER.exists():
         log.error("Network folder not found: %s", NETWORK_FOLDER)
@@ -634,23 +599,15 @@ async def lifespan(app: FastAPI):
 
         node_pos = _build_node_positions(schema)
         payload = _build_network_payload(schema, routing_network, node_pos)
-        available_names = {
-            variable["name"]
-            for variable in payload.get("available_weight_variables", [])
-        }
-
-        _schema = schema
         _routing_network = routing_network
         _node_pos = node_pos
         _network_payload = payload
-        _available_weight_variable_names = available_names
 
         log.info(
-            "Network ready: %d nodes / %d edges / %d GeoJSON features / weight variables: %s",
+            "Network ready: %d nodes / %d edges / %d GeoJSON features",
             routing_network.n_nodes,
             routing_network.n_edges,
             len(payload["geojson"]["features"]),
-            sorted(available_names),
         )
 
     except Exception as exc:
@@ -688,8 +645,7 @@ async def get_network() -> dict[str, Any]:
     Return the full edge network as a GeoJSON FeatureCollection.
 
     Array-valued edge properties such as utci_category and utci_median are
-    returned as JSON lists. The response also includes the fixed routing
-    variable used by the front-end.
+    returned as JSON lists so the front-end can select hourly values.
     """
     if _network_payload is None:
         raise HTTPException(
@@ -761,7 +717,6 @@ async def post_route(body: RouteRequest) -> dict[str, Any]:
         "duration_s": round(duration_s, 1) if duration_s is not None else None,
         "cost": round(route_cost, 3),
         "average_utci_median": round(average_utci_median, 2) if average_utci_median is not None else None,
-        "average_median_utci": round(average_utci_median, 2) if average_utci_median is not None else None,
         "weight_config": _serialisable_weight_config(weight_config),
         "weight_variables": [variable["name"] for variable in weight_config.get("variables", [])],
         "weight_hour": body.time.hour,
@@ -779,7 +734,6 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "network_loaded": _routing_network is not None,
         "network_folder": str(NETWORK_FOLDER),
-        "available_weight_variables": sorted(_available_weight_variable_names),
         "node_count": _routing_network.n_nodes if _routing_network else None,
         "edge_count": _routing_network.n_edges if _routing_network else None,
     }

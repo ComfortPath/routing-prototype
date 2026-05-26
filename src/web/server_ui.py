@@ -1,4 +1,4 @@
-"""Server-side logic for the Shiny UTCI network and route planner."""
+"""Server-side logic for the Shiny UTCI route planner."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from copy import deepcopy
 import math
 import statistics
 from typing import Any
+import asyncio
 
 from shiny import reactive, render, ui
 from maplibre import Layer, LayerType, Map, MapContext, MapOptions
@@ -24,12 +25,12 @@ from src.web.api_client import fetch_network, fetch_route
 HOURS = list(range(24))
 UTCI_CATEGORY_VARIABLE = "utci_category"
 UTCI_MEDIAN_VARIABLE = "utci_median"
-HOT_EDGE_GAMMA_STATE_FACTOR = 0.05
+HOT_EDGE_GAMMA_STATE_FACTOR = 0.02
 NETWORK_LAYER_ID = "network-edges"
 ROUTE_LAYER_ID = "route-path"
 MARKER_LAYER_ID = "route-markers"
 FALLBACK_CENTER = (4.48, 51.92)  # Rotterdam-ish default
-EMPTY_GEOJSON: dict = {"type": "FeatureCollection", "features": []}
+EMPTY_GEOJSON: dict[str, Any] = {"type": "FeatureCollection", "features": []}
 
 
 # ---------------------------------------------------------------------------
@@ -44,11 +45,7 @@ def _variable_label(variable_name: str) -> str:
 
 
 def weight_controls_ui() -> Any:
-    """Build the fixed route-preference controls.
-
-    Routing uses only UTCI category. UTCI median is still used for map colouring
-    and route reporting, but not as a routing weight.
-    """
+    """Build the fixed UTCI-category route-preference controls."""
     return ui.div(
         ui.p(
             "Routing uses UTCI category only. Set importance to 0 for the "
@@ -59,7 +56,7 @@ def weight_controls_ui() -> Any:
             "weight_utci_category",
             "UTCI category importance",
             min=0.0,
-            max=2.0,
+            max=1.0,
             value=1.0,
             step=0.1,
         ),
@@ -77,7 +74,7 @@ def weight_controls_ui() -> Any:
 
 
 def build_weight_config(input, selected_hour: int) -> dict[str, Any]:
-    """Build the routing.py weight_config dictionary from route-sidebar inputs."""
+    """Build the routing.py weight_config dictionary from sidebar inputs."""
     importance = float(input.weight_utci_category() or 0.0)
     if importance <= 0.0:
         return {"variables": []}
@@ -106,7 +103,7 @@ def build_weight_config(input, selected_hour: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _clean_float(value: Any) -> float | None:
-    """Return a finite float or None."""
+    """Return a finite float value, or None when conversion is impossible."""
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -118,14 +115,8 @@ def _clean_float(value: Any) -> float | None:
     return value
 
 
-def _hourly_value(props: dict, variable: str, hour: int) -> float | None:
-    """
-    Return props[variable][hour] as a float.
-
-    The expected API property shape is:
-
-        {"utci_median": [value_00, value_01, ..., value_23]}
-    """
+def _hourly_value(props: dict[str, Any], variable: str, hour: int) -> float | None:
+    """Return props[variable][hour] as a finite float when it is available."""
     values = props.get(variable)
 
     if not isinstance(values, list) or hour >= len(values):
@@ -134,7 +125,7 @@ def _hourly_value(props: dict, variable: str, hour: int) -> float | None:
     return _clean_float(values[hour])
 
 
-def _hour_values(network_data: dict, hour: int, variable: str) -> list[float]:
+def _hour_values(network_data: dict[str, Any], hour: int, variable: str) -> list[float]:
     """Collect valid selected-hour values from all network edge features."""
     values: list[float] = []
 
@@ -147,7 +138,7 @@ def _hour_values(network_data: dict, hour: int, variable: str) -> list[float]:
     return values
 
 
-def build_hour_stats(network_data: dict, variable: str) -> dict[int, dict[str, float]]:
+def build_hour_stats(network_data: dict[str, Any], variable: str) -> dict[int, dict[str, float]]:
     """Build min/median/max statistics for each hour of an array-valued variable."""
     stats: dict[int, dict[str, float]] = {}
 
@@ -165,29 +156,10 @@ def build_hour_stats(network_data: dict, variable: str) -> dict[int, dict[str, f
     return stats
 
 
-def global_bounds(hour_stats: dict[int, dict[str, float]]) -> tuple[float, float, float] | None:
-    """Compute global min/median/max across all available hours."""
-    if not hour_stats:
-        return None
-
-    mins = [s["min"] for s in hour_stats.values()]
-    maxs = [s["max"] for s in hour_stats.values()]
-    meds = [s["median"] for s in hour_stats.values()]
-
-    return min(mins), statistics.median(meds), max(maxs)
-
-
-def scale_bounds(
-    hour: int,
-    norm_mode: str,
-    hour_stats: dict[int, dict[str, float]],
-) -> tuple[float, float, float] | None:
-    """Return colour scale bounds for the current hour and normalisation mode."""
+def scale_bounds(hour: int, hour_stats: dict[int, dict[str, float]]) -> tuple[float, float, float] | None:
+    """Return per-hour colour scale bounds for the selected routing hour."""
     if not hour_stats or hour not in hour_stats:
         return None
-
-    if norm_mode == "global":
-        return global_bounds(hour_stats)
 
     s = hour_stats[hour]
     lo, mid, hi = s["min"], s["median"], s["max"]
@@ -199,13 +171,8 @@ def scale_bounds(
     return lo, mid, hi
 
 
-def geojson_for_hour(network_data: dict, hour: int, variable: str) -> dict:
-    """
-    Copy API GeoJSON and map props[variable][hour] to a single 'temp' property.
-
-    MapLibre can then colour edges using one stable property name regardless of
-    which hour is selected.
-    """
+def geojson_for_hour(network_data: dict[str, Any], hour: int, variable: str) -> dict[str, Any]:
+    """Copy API GeoJSON and expose props[variable][hour] as a scalar temp property."""
     geojson = deepcopy(network_data.get("geojson", EMPTY_GEOJSON))
 
     for feature in geojson.get("features", []):
@@ -216,11 +183,13 @@ def geojson_for_hour(network_data: dict, hour: int, variable: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Map helpers
+# Map and display helpers
 # ---------------------------------------------------------------------------
 
 def color_expression(t_min: float, t_mid: float, t_max: float) -> list:
-    """Return a blue-white-red MapLibre expression for the selected-hour value."""
+    """Return an Inferno MapLibre expression for the selected-hour UTCI value."""
+    span = t_max - t_min
+
     return [
         "case",
         ["==", ["get", "temp"], None],
@@ -230,18 +199,64 @@ def color_expression(t_min: float, t_mid: float, t_max: float) -> list:
             ["linear"],
             ["get", "temp"],
             t_min,
-            "#2166ac",
-            t_mid,
-            "#f7f7f7",
+            "#000004",
+            t_min + span * 0.1,
+            "#160b39",
+            t_min + span * 0.2,
+            "#420a68",
+            t_min + span * 0.3,
+            "#6a176e",
+            t_min + span * 0.4,
+            "#932667",
+            t_min + span * 0.5,
+            "#bc3754",
+            t_min + span * 0.6,
+            "#dd513a",
+            t_min + span * 0.7,
+            "#f37819",
+            t_min + span * 0.8,
+            "#fca50a",
+            t_min + span * 0.9,
+            "#f6d746",
             t_max,
-            "#d6191b",
+            "#fcffa4",
         ],
     ]
 
 
-def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
+def gradient_legend(bounds: tuple[float, float, float] | None) -> Any:
+    """Build the compact colour-gradient legend shown below the time slider."""
+    if bounds is None:
+        return ui.p(
+            "Hourly UTCI median data unavailable from API.",
+            style="font-size: 0.8em; color: #888; margin-top: 0.25rem;",
+        )
+
+    lo, mid, hi = bounds
+    return ui.div(
+        ui.tags.div(
+            style=(
+                "height: 10px; border-radius: 999px; margin-top: 0.35rem; "
+                "background: linear-gradient(to right, "
+                    "#000004, #160b39, #420a68, #6a176e, #932667, "
+                    "#bc3754, #dd513a, #f37819, #fca50a, #f6d746, #fcffa4);"
+            )
+        ),
+        ui.tags.div(
+            ui.span(f"{lo:.1f} °C"),
+            ui.span(f"{mid:.1f} °C"),
+            ui.span(f"{hi:.1f} °C"),
+            style=(
+                "display: flex; justify-content: space-between; font-size: 0.75em; "
+                "color: #aaa; margin-top: 0.2rem;"
+            ),
+        ),
+    )
+
+
+def build_map(center: tuple[float, float], geojson: dict[str, Any], line_color: Any) -> Map:
     """Create the base MapLibre map with network, route, and marker layers."""
-    m = Map(MapOptions(center=center, zoom=13, style=Carto.DARK_MATTER))
+    m = Map(MapOptions(center=center, zoom=13, style=Carto.POSITRON))
     m.add_control(NavigationControl(), position="bottom-right")
     m.add_control(ScaleControl(), position="bottom-left")
 
@@ -252,7 +267,7 @@ def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
             source=GeoJSONSource(data=geojson),
             paint={
                 "line-color": line_color,
-                "line-width": 1.5,
+                "line-width": 2,
                 "line-opacity": 0.9,
             },
         )
@@ -264,7 +279,7 @@ def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
             type=LayerType.LINE,
             source=GeoJSONSource(data=EMPTY_GEOJSON),
             paint={
-                "line-color": "#f0c040",
+                "line-color": "#ff0000",
                 "line-width": 4,
                 "line-opacity": 0.95,
             },
@@ -297,9 +312,9 @@ def build_map(center: tuple[float, float], geojson: dict, line_color) -> Map:
 def _marker_geojson(
     origin: tuple[float, float] | None,
     destination: tuple[float, float] | None,
-) -> dict:
+) -> dict[str, Any]:
     """Build a FeatureCollection for the selected origin/destination markers."""
-    features = []
+    features: list[dict[str, Any]] = []
 
     if origin:
         features.append({
@@ -319,12 +334,12 @@ def _marker_geojson(
 
 
 def _route_preference_summary(weight_config: dict[str, Any]) -> str:
-    """Return a compact text summary of selected route preference sliders."""
+    """Return a compact text summary of selected route preference controls."""
     variables = weight_config.get("variables", [])
     if not variables:
         return "Shortest path: no environmental variables selected."
 
-    parts = []
+    parts: list[str] = []
     for variable in variables:
         name = variable.get("name", "unknown")
         weight = variable.get("w", 0)
@@ -340,6 +355,53 @@ def _route_preference_summary(weight_config: dict[str, Any]) -> str:
 
     return "Routing preferences: " + ", ".join(parts)
 
+def compact_stat(label: str, value: str) -> Any:
+    """Return a compact sidebar statistic row."""
+    return ui.div(
+        ui.span(label, style="font-size: 0.85em; color: #666;"),
+        ui.span(value, style="font-size: 0.95em; font-weight: 600;"),
+        style=(
+            "display: flex; "
+            "justify-content: space-between; "
+            "align-items: center; "
+            "padding: 0.25rem 0; "
+            "border-bottom: 1px solid #eee;"
+        ),
+    )
+
+def compact_status(label: str, value: str, dot_color: str | None = None) -> Any:
+    """Return a compact sidebar status row."""
+    label_content = [ui.span(label, style="font-size: 0.85em; color: #666;")]
+
+    if dot_color is not None:
+        label_content.insert(
+            0,
+            ui.span(
+                "●",
+                style=f"color: {dot_color}; margin-right: 6px; font-size: 0.8em;",
+            ),
+        )
+
+    return ui.div(
+        ui.span(*label_content),
+        ui.span(
+            value,
+            style=(
+                "font-size: 0.9em; "
+                "font-weight: 600; "
+                "text-align: right; "
+                "max-width: 60%; "
+                "overflow-wrap: anywhere;"
+            ),
+        ),
+        style=(
+            "display: flex; "
+            "justify-content: space-between; "
+            "align-items: center; "
+            "padding: 0.25rem 0; "
+            "border-bottom: 1px solid #eee;"
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # Shiny server
@@ -347,12 +409,12 @@ def _route_preference_summary(weight_config: dict[str, Any]) -> str:
 
 def server(input, output, session):
     """Register Shiny reactives, map rendering, and API route requests."""
-    network_data = reactive.value(None)
-    load_error = reactive.value(None)
+    network_data: reactive.value[dict[str, Any] | None] = reactive.value(None)
+    load_error: reactive.value[str | None] = reactive.value(None)
 
     route_origin: reactive.value[tuple[float, float] | None] = reactive.value(None)
     route_destination: reactive.value[tuple[float, float] | None] = reactive.value(None)
-    route_result_data: reactive.value[dict | None] = reactive.value(None)
+    route_result_data: reactive.value[dict[str, Any] | None] = reactive.value(None)
     route_error: reactive.value[str | None] = reactive.value(None)
     route_loading: reactive.value[bool] = reactive.value(False)
     route_request_time: reactive.value[int | None] = reactive.value(None)
@@ -366,64 +428,65 @@ def server(input, output, session):
         return build_hour_stats(data, UTCI_MEDIAN_VARIABLE)
 
     @reactive.Calc
-    def selected_map_hour() -> int:
-        """Use the visible hour slider for the active app mode."""
-        if input.app_mode() == "route":
-            return int(input.time())
-        return int(input.hour())
-
-    # ── Load network ──────────────────────────────────────────────────────────
+    def selected_hour() -> int:
+        """Return the selected routing hour from the only visible hour slider."""
+        return int(input.time())
 
     @reactive.Effect
     async def _load_network():
-        if network_data() is not None or load_error() is not None:
+        """Load the network from the API, retrying while the backend starts."""
+        if network_data() is not None:
             return
 
-        try:
-            data = await fetch_network()
-        except Exception as exc:
-            load_error.set(str(exc))
-            return
+        last_error = None
 
-        network_data.set(data)
+        for _ in range(20):
+            try:
+                data = await fetch_network()
+                network_data.set(data)
+                load_error.set(None)
+                return
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.5)
 
-    # ── Initial map render ────────────────────────────────────────────────────
+        load_error.set(f"Failed to load network after retries: {last_error}")
 
     @render_maplibregl
-    def map():
+    def map() -> Map:
+        """Render the initial MapLibre map and selected-hour network layer."""
         data = network_data()
         stats = hour_stats_data()
 
         center = FALLBACK_CENTER
         geojson = EMPTY_GEOJSON
-        line_color = "#4da3ff"
+        line_color: Any = "#4da3ff"
 
         if data is not None:
             center = tuple(data.get("center", FALLBACK_CENTER))
 
             if stats:
-                bounds = scale_bounds(0, "per_hour", stats)
-                geojson = geojson_for_hour(data, 0, UTCI_MEDIAN_VARIABLE)
+                hour = selected_hour()
+                bounds = scale_bounds(hour, stats)
+                geojson = geojson_for_hour(data, hour, UTCI_MEDIAN_VARIABLE)
                 line_color = color_expression(*bounds) if bounds else "#4da3ff"
             else:
                 geojson = data.get("geojson", EMPTY_GEOJSON)
 
         return build_map(center, geojson, line_color)
 
-    # ── UTCI network updates ───────────────────────────────────────────
-
     @reactive.Effect
-    async def _update_map():
+    async def _update_map() -> None:
+        """Update network colours whenever the route-planning hour changes."""
         data = network_data()
         if data is None:
             return
 
         stats = hour_stats_data()
-
         if stats:
-            hour = selected_map_hour()
+            hour = selected_hour()
             geojson = geojson_for_hour(data, hour, UTCI_MEDIAN_VARIABLE)
-            bounds = scale_bounds(hour, input.norm_mode(), stats)
+            bounds = scale_bounds(hour, stats)
             line_color = color_expression(*bounds) if bounds else "#4da3ff"
         else:
             geojson = data.get("geojson", EMPTY_GEOJSON)
@@ -433,14 +496,10 @@ def server(input, output, session):
             m.set_data(NETWORK_LAYER_ID, geojson)
             m.set_paint_property(NETWORK_LAYER_ID, "line-color", line_color)
 
-    # ── Map click handler ─────────────────────────────────────────────────────
-
     @reactive.Effect
     @reactive.event(input.map_clicked)
-    async def _handle_map_click():
-        if input.app_mode() != "route":
-            return
-
+    async def _handle_map_click() -> None:
+        """Use the first two map clicks as route origin and destination."""
         click = input.map_clicked()
         if click is None:
             return
@@ -464,11 +523,10 @@ def server(input, output, session):
         async with MapContext("map") as m:
             m.set_data(MARKER_LAYER_ID, _marker_geojson(route_origin(), route_destination()))
 
-    # ── Clear points button ───────────────────────────────────────────────────
-
     @reactive.Effect
     @reactive.event(input.clear_points)
-    async def _clear_points():
+    async def _clear_points() -> None:
+        """Clear selected points, route output, and map route geometry."""
         route_origin.set(None)
         route_destination.set(None)
         route_result_data.set(None)
@@ -479,11 +537,10 @@ def server(input, output, session):
             m.set_data(MARKER_LAYER_ID, EMPTY_GEOJSON)
             m.set_data(ROUTE_LAYER_ID, EMPTY_GEOJSON)
 
-    # ── Find route button ─────────────────────────────────────────────────────
-
     @reactive.Effect
     @reactive.event(input.find_route)
-    async def _find_route():
+    async def _find_route() -> None:
+        """Request a route for the selected origin, destination, hour, and weights."""
         origin = route_origin()
         dest = route_destination()
 
@@ -491,9 +548,9 @@ def server(input, output, session):
             route_error.set("Please click two points on the map first.")
             return
 
-        selected_hour = int(input.time())
-        weight_config = build_weight_config(input, selected_hour)
-        route_request_time.set(selected_hour)
+        hour = selected_hour()
+        weight_config = build_weight_config(input, hour)
+        route_request_time.set(hour)
         route_error.set(None)
         route_loading.set(True)
 
@@ -501,10 +558,10 @@ def server(input, output, session):
             result = await fetch_route(
                 origin,
                 dest,
-                selected_hour,
+                hour,
                 weight_config=weight_config,
             )
-            result["requested_hour"] = selected_hour
+            result["requested_hour"] = hour
             result["requested_weight_config"] = weight_config
             route_result_data.set(result)
 
@@ -517,67 +574,59 @@ def server(input, output, session):
         finally:
             route_loading.set(False)
 
-    # ── Network/sidebar outputs ───────────────────────────────────────────────
-
     @render.text
-    def hour_label():
-        return f"{input.hour():02d}:00"
-
-    @render.text
-    def time_label():
-        return f"{input.time():02d}:00"
+    def time_label() -> str:
+        """Show the selected route-planning hour as HH:00."""
+        return f"{selected_hour():02d}:00"
 
     @render.ui
-    def network_stats():
+    def time_gradient() -> Any:
+        """Show the selected-hour UTCI colour gradient below the time slider."""
+        if load_error() is not None:
+            return ui.p("Colour scale unavailable because the network failed to load.")
+
+        return gradient_legend(scale_bounds(selected_hour(), hour_stats_data()))
+
+    @render.ui
+    def stats():
+        """Render compact network and selected-hour UTCI statistics."""
         if load_error() is not None:
             return ui.p(f"Failed to load network: {load_error()}")
 
         data = network_data()
         if data is None:
-            return ui.p("Loading network...")
+            return ui.p("Loading stats...")
 
-        return ui.layout_columns(
-            ui.value_box("Nodes", f"{data['node_count']:,}"),
-            ui.value_box("Edges", f"{data['edge_count']:,}"),
-            col_widths=[6, 6],
-        )
+        stat_rows = [
+            compact_stat("Nodes", f"{data['node_count']:,}"),
+            compact_stat("Edges", f"{data['edge_count']:,}"),
+        ]
 
-    @render.ui
-    def temp_stats():
-        if load_error() is not None:
-            return ui.p("Hourly values unavailable because the network failed to load.")
+        hour = int(input.time())
+        hour_stats = hour_stats_data()
 
-        stats = hour_stats_data()
-        hour = input.hour()
-        variable = UTCI_MEDIAN_VARIABLE
+        if hour_stats and hour in hour_stats:
+            s = hour_stats[hour]
+            stat_rows.extend(
+                [
+                    compact_stat("UTCI min", f"{s['min']:.1f} °C"),
+                    compact_stat("UTCI median", f"{s['median']:.1f} °C"),
+                    compact_stat("UTCI max", f"{s['max']:.1f} °C"),
+                ]
+            )
+        else:
+            stat_rows.append(
+                ui.p(
+                    "Selected-hour UTCI data unavailable.",
+                    style="font-size: 0.85em; color: #888;",
+                )
+            )
 
-        if not stats or hour not in stats:
-            return ui.p(f"No hourly UTCI median property named {variable!r} is exposed by the API.")
-
-        s = stats[hour]
-        return ui.layout_columns(
-            ui.value_box("Min", f"{s['min']:.1f}"),
-            ui.value_box("Median", f"{s['median']:.1f}"),
-            ui.value_box("Max", f"{s['max']:.1f}"),
-            col_widths=[4, 4, 4],
-        )
-
-    @render.ui
-    def scale_range():
-        if load_error() is not None:
-            return ui.p("Unavailable.")
-
-        bounds = scale_bounds(input.hour(), input.norm_mode(), hour_stats_data())
-        if bounds is None:
-            return ui.p("Hourly UTCI median data unavailable from API.")
-
-        lo, _, hi = bounds
-        return ui.p(f"{lo:.1f} °C (blue)  ->  {hi:.1f} °C (red)")
-
-    # ── Route planner sidebar outputs ─────────────────────────────────────────
+        return ui.div(*stat_rows)
 
     @render.ui
-    def weight_controls():
+    def weight_controls() -> Any:
+        """Show route-preference controls once the network has loaded."""
         if load_error() is not None:
             return ui.p("Route preferences unavailable because the network failed to load.")
 
@@ -587,62 +636,73 @@ def server(input, output, session):
         return weight_controls_ui()
 
     @render.ui
-    def origin_display():
-        origin = route_origin()
-        if origin is None:
-            return ui.p(ui.em("Click the map to set origin"), style="color: #888;")
-        return ui.p(
-            ui.span("●", style="color: #44dd88; margin-right: 6px;"),
-            f"{origin[1]:.5f} N,  {origin[0]:.5f} E",
-        )
-
-    @render.ui
-    def destination_display():
+    def locations_display():
+        """Render selected origin and destination as one compact sidebar element."""
         origin = route_origin()
         destination = route_destination()
+
         if origin is None:
-            return ui.p(ui.em("Set origin first"), style="color: #888;")
-        if destination is None:
-            return ui.p(ui.em("Click the map to set destination"), style="color: #888;")
-        return ui.p(
-            ui.span("●", style="color: #ff5555; margin-right: 6px;"),
-            f"{destination[1]:.5f} N,  {destination[0]:.5f} E",
+            origin_value = "Click map"
+        else:
+            origin_value = f"{origin[1]:.5f}, {origin[0]:.5f}"
+
+        if origin is None:
+            destination_value = "Set origin first"
+        elif destination is None:
+            destination_value = "Click map"
+        else:
+            destination_value = f"{destination[1]:.5f}, {destination[0]:.5f}"
+
+        return ui.div(
+            compact_status("Origin", origin_value, "#44dd88"),
+            compact_status("Destination", destination_value, "#ff5555"),
         )
 
     @render.ui
     def route_result():
+        """Render route results as compact sidebar rows."""
         if route_loading():
-            return ui.p("Fetching route…")
+            return compact_status("Route", "Fetching…")
 
         err = route_error()
         if err:
-            return ui.div(ui.p(err, style="color: #ff6666;"))
+            return ui.div(
+                compact_status("Route", "Error"),
+                ui.p(
+                    err,
+                    style="font-size: 0.85em; color: #ff6666; margin-top: 0.4rem;",
+                ),
+            )
 
         result = route_result_data()
         if result is None:
-            return ui.p(ui.em("No route yet."), style="color: #888;")
+            return compact_status("Route", "No route yet")
 
         distance_m = result.get("distance_m")
         avg_utci_median = result.get("average_utci_median")
         if avg_utci_median is None:
             avg_utci_median = result.get("average_median_utci")
+
         returned_config = result.get("weight_config") or result.get("requested_weight_config") or {}
 
-        parts = []
+        rows = []
+
         if distance_m is not None:
-            parts.append(ui.value_box("Distance", f"{distance_m / 1000:.2f} km"))
+            rows.append(compact_status("Distance", f"{distance_m / 1000:.2f} km"))
+
         if avg_utci_median is not None:
-            parts.append(ui.value_box("Avg. median UTCI", f"{avg_utci_median:.1f} °C"))
+            rows.append(compact_status("Avg. UTCI", f"{avg_utci_median:.1f} °C"))
 
-        detail = ui.p(
-            _route_preference_summary(returned_config),
-            style="font-size: 0.9em; color: #aaa; margin-top: 0.5rem;",
+        rows.append(
+            ui.p(
+                _route_preference_summary(returned_config),
+                style=(
+                    "font-size: 0.8em; "
+                    "color: #777; "
+                    "line-height: 1.25; "
+                    "margin-top: 0.5rem;"
+                ),
+            )
         )
 
-        if not parts:
-            return ui.div(ui.p("Route received — no distance or UTCI summary in response."), detail)
-
-        return ui.div(
-            ui.layout_columns(*parts, col_widths=[6] * min(len(parts), 2)),
-            detail,
-        )
+        return ui.div(*rows)
