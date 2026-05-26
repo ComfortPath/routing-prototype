@@ -32,6 +32,12 @@ The application consists of two servers:
 
 Start both servers from the project root in separate terminal windows.
 
+### Install the dependencies
+To run the servers first install the repository dependencies from `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
 ### 1. Start the routing backend
 
 ```bash
@@ -69,4 +75,3 @@ http://127.0.0.1:8001
 ```
 
 The web application and routing backend must both be running for the application to work.
-
