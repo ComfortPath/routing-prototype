@@ -45,7 +45,7 @@ from src.schema import NetworkSchema
 # Configuration
 # ---------------------------------------------------------------------------
 
-_DEFAULT_NETWORK_FOLDER = Path(__file__).resolve().parents[2] / "data" / "network_final" / "red_bbox"
+_DEFAULT_NETWORK_FOLDER = Path(__file__).resolve().parents[2] / "data" / "network_final"
 NETWORK_FOLDER = Path(os.getenv("NETWORK_FOLDER", str(_DEFAULT_NETWORK_FOLDER)))
 DEFAULT_WEIGHT_VARIABLE = "utci_category"
 UTCI_MEDIAN_VARIABLE = "utci_median"
